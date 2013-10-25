@@ -1,0 +1,5 @@
+.deps_plt
+deps/
+apps/*/ebin
+apps/*/doc
+release/beatnet

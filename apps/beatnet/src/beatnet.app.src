@@ -1,0 +1,22 @@
+{application, beatnet,
+ [
+  {description, "WAAAAAAA"},
+  {vsn, git},
+  {registered, [beatnet_sup, 
+                beatnet]},
+  {applications, [kernel,
+                  stdlib,
+                  inets,
+                  crypto,
+                  ssl,
+                  ibrowse,
+                  lager,
+                  folsom,
+                  webmachine,
+                  mnesia,
+                  syntax_tools,
+                  mochiweb
+                 ]},
+  {mod, {beatnet_app, []}},
+  {env, []}
+ ]}.

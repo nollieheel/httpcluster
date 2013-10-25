@@ -1,2 +1,4 @@
-erl-beatnet
+beatnet
 ===========
+
+By Earth
