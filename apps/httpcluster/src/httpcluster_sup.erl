@@ -1,4 +1,4 @@
--module(beatnet_sup).
+-module(httpcluster_sup).
 
 -behaviour(supervisor).
 
@@ -29,6 +29,6 @@ start_link(Opts) ->
 init(Opts) ->
     {'ok', {{'one_for_one', 10, 10},
             [
-             ?CHILD('beatnet', 'worker', Opts)
+             ?CHILD('httpcluster', 'worker', Opts)
             ]
            }}.

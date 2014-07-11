@@ -1,0 +1,14 @@
+{application, httpcluster,
+ [
+  {description, "Node cluster over http"},
+  {vsn, git},
+  {registered, [httpcluster_sup, 
+                httpcluster]},
+  {applications, [kernel,
+                  stdlib,
+                  meck,
+                  lager
+                 ]},
+  {mod, {httpcluster_app, []}},
+  {env, []}
+ ]}.

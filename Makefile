@@ -15,7 +15,7 @@
 # under the License.
 #
 
-APPNAME=beatnet
+APPNAME=httpcluster
 ERLFLAGS= -pa $(CURDIR)/.eunit -pa $(CURDIR)/ebin -pa $(CURDIR)/deps/*/ebin
 
 DEPS_PLT=$(CURDIR)/.deps_plt
@@ -106,4 +106,5 @@ run: release
 	release/$(APPNAME)/bin/$(APPNAME) console
 
 relclean:
+# Clean only the generated release files
 	rm -rf release/$(APPNAME)

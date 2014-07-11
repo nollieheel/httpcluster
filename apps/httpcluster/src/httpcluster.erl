@@ -1,4 +1,4 @@
--module(beatnet).
+-module(httpcluster).
 
 -behaviour(gen_server).
 

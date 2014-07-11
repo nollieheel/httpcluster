@@ -1,5 +1,5 @@
 ## Name of the node
--sname beatnet
+-sname httpcluster
 
 ## Cookie for distributed erlang
 -setcookie SOMESECRETCOOKIE12345
