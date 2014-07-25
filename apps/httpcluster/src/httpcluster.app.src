@@ -3,12 +3,30 @@
   {description, "Node cluster over http"},
   {vsn, git},
   {registered, [httpcluster_sup, 
-                httpcluster]},
-  {applications, [kernel,
-                  stdlib,
-                  meck,
-                  lager
-                 ]},
+                httpcluster,
+                httpcluster_sec]},
+  {applications, [kernel, stdlib, lager]},
   {mod, {httpcluster_app, []}},
-  {env, []}
+  {env, [
+         %% Determines values for node health ping time and ttd 
+         %% if they are set to zero by the user.
+         {default_node_ping, 180000},
+         {default_node_ttd, 300000},
+
+         %% The length of past events list that the cluster keeps track of.
+         {evts_history_len, 20},
+
+         %% Communications module to use. This module must
+         %% implement the 'hc_comms' behavior.
+         {comms_module, httpcluster_coms},
+
+         %% Additional milliseconds that the primary node adds as allowance
+         %% to each node's TTD value.
+         {ttd_delay_allow, 0},
+
+         %% Describes how many times a failed ping is retried, and how 
+         %% long before each retry. This also affects regular health pings.
+         {evt_ping_retry_freq, 3},
+         {evt_ping_retry_time, 30000}
+        ]}
  ]}.

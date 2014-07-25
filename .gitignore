@@ -1,6 +1,11 @@
 .deps_plt
 deps/
 apps/*/ebin
-apps/*/doc
+apps/*/.eunit
+apps/*/log
+apps/*/doc/*.html
+apps/*/doc/*.css
+apps/*/doc/*.png
+apps/*/doc/edoc-info
 release/httpcluster
-
+notes/

@@ -24,27 +24,18 @@ DEPS=erts kernel stdlib
 # =============================================================================
 # Verify that the programs we need to run are installed on this system
 # =============================================================================
-ERL = $(shell which erl)
+ERL=$(shell which erl)
 
 ifeq ($(ERL),)
 $(error "Erlang not available on this system")
 endif
 
-#REBAR=$(shell which rebar)
-
-#ifeq ($(REBAR),)
-#$(error "Rebar not available on this system")
-#endif
-
-#My rebar is a standalone file
 REBAR=./rebar
 
 .PHONY: all compile doc clean test dialyzer shell distclean \
   update-deps rebuild release run relclean
 
-#all: deps compile dialyzer test
-#Don't do test for now
-all: deps compile dialyzer
+all: deps compile dialyzer test
 
 # =============================================================================
 # Rules to build the system
@@ -89,15 +80,14 @@ shell: deps compile
 
 clean:
 	- rm -rf $(CURDIR)/test/*.beam
-	- rm -rf $(CURDIR)/logs
+	- rm -rf $(CURDIR)/log
 	$(REBAR) skip_deps=true clean
 
 distclean: clean
 	- rm -rf $(DEPS_PLT)
 	- rm -rvf $(CURDIR)/deps
 
-#rebuild: distclean deps compile dialyzer test
-rebuild: distclean deps compile dialyzer
+rebuild: distclean deps compile dialyzer test
 
 release: deps compile
 	$(REBAR) generate -f

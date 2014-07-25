@@ -1,0 +1,9 @@
+@author nollieheel <iskitingbords@gmail.com>
+@copyright 2014, nollieheel
+@version 0.0.3
+@title Node cluster (supposedly) over http.
+
+@doc
+
+== About ==
+`httpcluster' is a node cluster with a customizable communications protocol.

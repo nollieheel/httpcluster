@@ -62,6 +62,7 @@ case "$1" in
         mkdir -p $PIPE_DIR
         shift # remove $1
         $ERTS_PATH/run_erl -daemon $PIPE_DIR $RUNNER_LOG_DIR "exec $RUNNER_BASE_DIR/bin/$SCRIPT console $@" 2>&1
+        # TODO add Mike's check for $PIPE_DIR after 5 seconds????
         ;;
 
     stop)

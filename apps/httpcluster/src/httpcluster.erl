@@ -1,864 +1,1090 @@
+%%% @author nollieheel <iskitingbords@gmail.com>
+%%% @copyright 2014, nollieheel
+%%% @doc Handles cluster information. This module runs the main primary-node
+%%%      functions such as triggering TTD timers on nodes, refreshing them
+%%%      if the nodes check in, and manipulating node info when requested.
+%%%
+%%%      The cluster information being run by the primary node then becomes 
+%%%      the source of truth for all secondary nodes.
+%%%
+%%%      Nodes check in (health check) using {@link node_ping/1}. If
+%%%      they fail to do that within their TTD window, a node-down event
+%%%      is automatically triggered within the module and the cluster info
+%%%      is updated.
+
 -module(httpcluster).
 -behaviour(gen_server).
 
-%TODO this entire module is whack
-
 -include("httpcluster_int.hrl").
--include("httpcluster.hrl").
--export_type([mnode/0, evt/0]).
+-include("../include/httpcluster.hrl").
+
+%% API
+-export([
+    start/0,
+    start_link/1,
+    soft_init/1,
+    hard_activate/3,
+    node_ping/1,
+    deactivate/0,
+    is_active/0
+]).
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
-%% API
+%% Module internal
 -export([
-    evt2struct/1,
-    struct2evt/1,
-    mnode2proplist/1,
-    json2mnode/1,
-    validate_event_props/1
+    'cast_node_pong'/3,
+    'reply_with_node_reply_error'/6,
+    'reply_with_node_pong_ok'/6
 ]).
-
-%% Used internally
--export([
-    start_link/1,
-    new_remote_evt/1,
-    new_remote_evts/1,
-    get_sec_ping_details/0,
-    apply_handler_fun/2,
-    get_app_var/1,
-    get_app_var/2
-]).
-
-% this_node  :: name of this node
-% prim       :: name of node being currently treated as primary
-% prim_ex    :: nodes exempted from being primary
-% hist       :: lists the events that have already been applied to the network
-% wait_ev    :: raw events on wait-list (not applied yet)
--record(net, {
-    this_node    :: 'undefined' | mnode_name(),
-    nodes   = [] :: [mnode()],
-    prim         :: 'undefined' | mnode_name(),
-    prim_ex = [] :: [{mnode_name(), ttd_type()}],
-    hist    = [] :: [evt()],
-    wait_ev = [] :: [evt_raw()]
-}).
--type net() :: #net{}.
 
 -define(SERVER, ?MODULE).
 
+%%====================================================================
+%% Types
+%%====================================================================
+
+-type local_id() :: reference().
+
+-record(pnode, {
+    local_id :: local_id(),
+    name     :: string(),
+    ttd      :: pos_integer(),
+    con      :: boolean(),
+    rank     :: non_neg_integer(),
+    prio     :: non_neg_integer(),
+    attribs  :: 'undefined' | binary() % term_to_binary(Attribs)
+}).
+-type pnode() :: #pnode{}.
+%% This module's own representation of hc_node:cnode(). 
+%% A pnode() will only exist locally within the context of the primary node;
+%% it will not be communicated to the network like an hc_node:cnode().
+%%
+%% Most of these values are of similar type as in hc_node:cnode().
+
+-record(sd, {
+    init_id    :: 'undefined' | local_id(),
+    this_id    :: 'undefined' | local_id(),
+    nodes = [] :: [pnode()],
+    evts  = [] :: [hc_evt:evt() | hc_evt:evt_err()],
+    timers     :: hc_timer:timers()
+}).
+-type sd() :: #sd{}.
+%% Internal state data.
 
 %%====================================================================
 %% API
 %%====================================================================
 
+%% @doc Useful for starting the VM with `-s httpcluster' flag.
+-spec start() -> {ok, Started} | {error, Error}
+    when Started :: [atom()], Error :: any().
+start() ->
+    application:ensure_all_started('httpcluster').
+
+%% @private
 start_link(Opts) ->
     gen_server:start_link({local, ?SERVER}, ?MODULE, [Opts], []).
 
+%% @doc Put the server on standby, awaiting ping from self node. This
+%%      is the same as not active, but the server will respond to a future
+%%      nodeup event coming from the given node. It will keep doing this 
+%%      as long as it is not activated/deactivated.
+-spec soft_init(ThisNode) -> ok | {error, 'already_active'}
+    when ThisNode :: hc_node:cnode().
+soft_init(ThisNode) ->
+    gen_server:call(?SERVER, {'soft_init', ThisNode}).
 
-evt2struct(#evt{}=_E) ->
-    %TODO
-    % no need to append 'struct', but do it for posterity
-    {'struct', []}.
-
-
-struct2evt({'struct', _Ls}) ->
-    %TODO
-    #evt{}.
-
-
-struct2evt_err({'struct', _Ls}) ->
-    %TODO,
-    #evt_err{}
-
--spec mnode2proplist(mnode()) -> list().
-%% @doc Utility fun.
-mnode2proplist(#mnode{}=N) ->
-    [
-        {"name", N#mnode.mname},
-        {"prio", N#mnode.prio},
-        {"rank", N#mnode.rank},
-        {"ping", N#mnode.ping},
-        {"ttd", N#mnode.ttd},
-        {"attribs", N#mnode.attribs}
-    ].
-
-
--spec json2mnode({'struct', list()}) -> mnode().
-%% @doc Utility fun.
-json2mnode({'struct', Ls}) ->
-    #mnode{
-        mname   = erlang:binary_to_atom(prop_val(<<"mname">>, Ls), 'utf8'),
-        con     = prop_val(<<"con">>, Ls),
-        prio    = prop_val(<<"prio">>, Ls),
-        rank    = prop_val(<<"rank">>, Ls),
-        ping    = prop_val(<<"ping">>, Ls),
-        ttd     = prop_val(<<"ttd">>, Ls),
-        attribs = stringify_json(prop_val(<<"attribs">>, Ls))
-    }.
-
-stringify_json({'struct', Obj}) -> stringify_json(Obj);
-stringify_json({K, V})          -> {stringify_key(K), stringify_json(V)};
-stringify_json([H|T])           -> [stringify_json(H)|stringify_json(T)];
-stringify_json(X)               -> stringify_key(X).
-
-stringify_key(K) when is_binary(K) -> binary_to_list(K);
-stringify_key(K)                   -> K.
-
-
--spec validate_event_props(evt()) -> 
-    ok | {error, 'invalid_node_val' | 'invalid_mname_val' | 'invalid_ttd_val' |
-                 'invalid_ping_val' | 'invalid_prio_val'}.
-%% TODO correct intent. wrong implementation.
-%% values must be validated BEFORE being made into an event record!!!!!!!!!
-%check dialyzer for clues.
-%% update: this is also outdated. definitions have been updated.
-
-%% Make sure an event contains all needed information.
+%% @doc Activate the server as primary with a new set of `Nodes' and `Evts'.
+%%      `ThisName' is the name of this node, which must be present in `Nodes'.
 %%
-%% When on secondary node role, on event ?EVT_NODE_UP, 
-%% relevant info transmitted from the primary node are:
-%%    type = ?EVT_NODE_UP
-%%    ref
-%%    time
-%%    node_new
-%% Relevant info for node_new:
-%%    mname
-%%    prio
-%%    ping
-%%    ttd
-%%    attribs
-%% On primary node role, the above node_new values are also the
-%% relevant values received when a node tries to connect.
-%% This is the only event type accepted from a disconnected or 
-%% previously non-existing node.
+%%      Calling this function again after the server has been activated 
+%%      will result in an error.
+-spec hard_activate(ThisName, Nodes, Evts) -> 
+    ok | {error, 'this_node_not_found' | 'already_active'}
+    when
+        ThisName :: hc_node:name(),
+        Nodes    :: hc_node:cnodes(),
+        Evts     :: [hc_evt:evt() | hc_evt:evt_err()].
+hard_activate(ThisName, Nodes, Evts) ->
+    gen_server:call(?SERVER, {'hard_activate', ThisName, Nodes, Evts}).
+
+%% @doc Process a {@link hc_evt:node_ping()} coming from a single source.
+%%      The ping may or may not contain an `evt_raw'.
 %%
-%% When on secondary node role, on event ?EVT_NODE_DOWN, 
-%% relevant info transmitted from the primary node are:
-%%    type = ?EVT_NODE_DOWN
-%%    ref
-%%    time
-%%    node_old
-%% Relevant info for node_old:
-%%    mname
-%% On primary node role, the above node_old values are also the 
-%% relevant values received when a node tries to gracefully disconnect.
+%%      If successful, return the result as a {@link hc_evt:node_pong()}, 
+%%      along with the most recent list of nodes if the ping was a sync.
+%%      The nodes returned in this way is the list just before
+%%      the `evt_raw' is applied. Additionally, the `node_pong' will be
+%%      broadcasted to all other live nodes. 
 %%
-%% When on secondary node role, on event ?EVT_NODE_EDIT, 
-%% relevant info transmitted from the primary node are:
-%%    type = ?EVT_NODE_EDIT
-%%    ref
-%%    time
-%%    node_old
-%%    node_new
-%% Relevant info for node_old:
-%%    mname
-%% Relevant info for node_new:
-%%    mname
-%%    prio
-%%    ping
-%%    ttd
-%% On primary node role, the above node_new/old values are also the 
-%% relevant values received when a node tries to edit its own properties.
+%%      If the ping is invalid, or a {@link hc_evt:node_reply()}
+%%      resulted from processing the ping, then no broadcast will happen.
 %%
-%% When on secondary node role, on a user-defined event, 
-%% relevant info transmitted from the primary node are:
-%%    type = <user-defined>
-%%    ref
-%%    time
-%%    node_old
-%%    node_new
-%% Relevant info for node_old:
-%%    mname
-%% Relevant info for node_new:
-%%    attribs
-%% On primary node role, the above node_new/old values are also the 
-%% relevant values received when a node emits a user-defined event.
-validate_event_props(Evt) ->
-    try validate_event(Evt), ok
-    catch throw:Error -> {error, Error}
-    end.
+%%      Calling this function also serves as a health check for
+%%      the ping source regardless if there was an `evt_raw' in it or not.
+%%
+%%      The actual returned value `Data' will be the {@link hc_evt:node_pong()}
+%%      or {@link hc_evt:node_reply()} filtered through the client comm module
+%%      function `create_pongdata/3'.
+-spec node_ping(Ping) -> {ok, Data}
+    when Ping :: hc_evt:node_ping(), Data :: term().
+node_ping(Ping) ->
+    gen_server:call(?SERVER, {'node_ping', Ping}).
 
-validate_event(#evt{type=?EVT_NODE_UP, node_new=Node}) ->
-    validate_mname_val(Node),
-    validate_int_mnode_vals(Node);
-validate_event(#evt{type=?EVT_NODE_DOWN, node_old=Node}) ->
-    validate_mname_val(Node);
-validate_event(#evt{type=?EVT_NODE_EDIT, node_old=Node1, node_new=Node2}) ->
-    validate_mname_val(Node1),
-    validate_mname_val(Node2),
-    validate_int_mnode_vals(Node2);
-validate_event(#evt{type=_, node_old=Node}) ->
-    validate_mname_val(Node).
+%% @doc Turn off active state.
+-spec deactivate() -> ok | {error, 'not_active'}.
+deactivate() ->
+    gen_server:call(?SERVER, 'deactivate').
 
-validate_mname_val('undefined') ->
-    throw('invalid_node_val');
-validate_mname_val(#mnode{mname=N}) 
-    when not is_atom(N) orelse N =:= 'undefined' ->
-    throw('invalid_mname_val');
-validate_mname_val(#mnode{}) ->
-    ok.
-
-validate_int_mnode_vals(#mnode{ttd=N}) when not is_integer(N) orelse N < 0 ->
-    throw('invalid_ttd_val');
-validate_int_mnode_vals(#mnode{ping=N}) when not is_integer(N) orelse N < 0 ->
-    throw('invalid_ping_val');
-validate_int_mnode_vals(#mnode{prio=N}) when not is_integer(N) orelse N < 0 ->
-    throw('invalid_prio_val');
-validate_int_mnode_vals(#mnode{}) ->
-    ok.
-
-
--spec new_remote_evt(evt()) -> ok | {error, any()}.
-%% @doc Process a cluster event from the primary node. If this node IS the 
-%%      primary, the function may return an error if necessary, signifying the 
-%%      event cannot be accepted. If this node is secondary, 
-%%      the return value is always ok.
-new_remote_evt(Evt) ->
-    gen_server:call(?SERVER, {'new_remote_evt', Evt}).
-
-
--spec new_remote_evts([evt()]) -> ok.
-%% @doc Send in new cluster events. This version can only accept events
-%%      that have already been timestamped (i.e. defined ref and time values).
-new_remote_evts(Evts) ->
-    lists:foreach(fun(Evt) -> 
-        new_remote_evt(Evt) 
-    end, lists:keysort(#evt.time, Evts)),
-    ok.
-
-
--spec get_sec_ping_details() -> 
-    {ok, {mnode() | 'undefined', 
-          mnode() | 'undefined', 
-          evt_ref() | 'undefined'}}.
-%% @doc Returns this node, the primary node, and the last history event ref.
-get_sec_ping_details() ->
-    gen_server:call(?SERVER, 'get_sec_ping_details').
-
-
--spec apply_handler_fun(atom(), [term()]) -> term().
-%% @doc Apply user-defined handler functions. These functions should
-%%      be implemented in the module given as the ?MOD_COMS app variable.
-apply_handler_fun(Fun, Args) ->
-    Mod = get_app_var(?MOD_COMS, ?DEF_MOD_COMS),
-    apply(Mod, Fun, Args).
-
-
--spec get_app_var(atom()) -> term().
-%% @doc Wrapper fun for getting an app variable value.
-get_app_var(?HIST_LEN) -> get_app_var(?HIST_LEN, ?DEF_HIST_LEN);
-get_app_var(?DEF_PING) -> get_app_var(?DEF_PING, ?DEF_DEF_PING);
-get_app_var(?DEF_TTD)  -> get_app_var(?DEF_TTD, ?DEF_DEF_TTD);
-get_app_var(?MOD_COMS) -> get_app_var(?MOD_COMS, ?DEF_MOD_COMS);
-get_app_var(Atom)      -> get_app_var(Atom, 'undefined').
-
-
--spec get_app_var(atom(), term()) -> term().
-%% @doc Wrapper fun for getting an app variable value.
-get_app_var(Prop, Def) ->
-    {ok, App} = application:get_application(),
-    application:get_env(App, Prop, Def).
-
+%% @doc Check if currently active or not.
+-spec is_active() -> boolean().
+is_active() ->
+    gen_server:call(?SERVER, 'is_active').
 
 %%====================================================================
 %% gen_server callbacks
 %%====================================================================
 
+%% @private
 init([_Opts]) ->
-    {ok, reset_state(#net{})}.
+    process_flag('trap_exit', true),
+    {ok, #sd{timers = hc_timer:empty()}}.
 
-%TODO on network init, call main httpcluster module for details about
-% this node.
-% So the main module contains a copy, and this module contains a copy.
-% If main module wishes to modify this node, call this module. Then this module
-% should communicate on next opportunity to the cluster about the attrib change.
+%% @private
+handle_call({'soft_init', Node}, _From, #sd{this_id='undefined'}=Sd) ->
+    #pnode{local_id=Id} = Pnode = from_cnode(Node),
+    {reply, ok, Sd#sd{init_id = Id, nodes = [Pnode]}};
 
+handle_call({'soft_init', _}, _From, Sd) ->
+    {reply, {error, 'already_active'}, Sd};
 
+handle_call(
+    {'hard_activate', ThisName, Cnodes, Evts}, _From, #sd{this_id='undefined'}=Sd
+) ->
+    {Nodes1, Timers1} = lists:foldl(
+        fun(Cnode, {Ns, Ts}) ->
+            Pnode = from_cnode(Cnode),
+            {[Pnode|Ns], trigger_timer(Pnode, Ts, false)}
+        end,
+        {[], hc_timer:empty()}, hc_node:cnodes_to_list(Cnodes)
+    ),
+    case get_node(ThisName, Nodes1) of
+        #pnode{local_id=Id} ->
+            % Seed now for future hc_evt:random_str/1 calls
+            random:seed(now()),
+            {reply, ok, update_sd(
+                Evts, Nodes1, Timers1, 
+                Sd#sd{init_id = 'undefined', this_id = Id}
+            )};
+        'undefined' ->
+            hc_timer:all_off(Timers1),
+            {reply, {error, 'this_node_not_found'}, Sd}
+    end;
 
-% TODO client supplies thisnode here. Minimum allowed info: 
-% mname, prio, ping, ttd, attribs
-% TODO client supplies a list of mnodes here. Each mnode contains the bare
-% minimum allowed to establish contact to that node: mname and attribs
-handle_call({'init_network', ThisNode, InitNodes}, From, Net) ->
-    gen_server:reply(From, ok),
-    Net1 = this_connect_network(ThisNode, InitNodes, Net),
-    {noreply, Net1};
+handle_call({'hard_activate', _,_,_}, _From, Sd) ->
+    {reply, {error, 'already_active'}, Sd};
 
-%TODO on 'other_node_init', filter the error for 'mnode_up' error. On such a case, reply with an empty event list, instead of an error. See this previous implementation:
-%other_connect_network(NodeupEvt, #net{prim=Prim, this_node=Prim}=Net) ->
-%    case process_remote_event(NodeupEvt, Net) of
-%        {ok, Evt, Net1}           -> {ok, {Net#net.nodes, [Evt]}, Net1};
-%        {error, 'mnode_up', Net1} -> {ok, {Net#net.nodes, []}, Net1};
-%        {error, _,_}=Error        -> Error
-%    end;
+handle_call({'node_ping', Ping}, From, Sd) ->
+    {noreply, handle_node_ping(Ping, From, Sd)};
 
+handle_call('deactivate', _From, #sd{this_id='undefined'}=Sd) ->
+    {reply, {error, 'not_active'}, Sd#sd{init_id = 'undefined'}};
 
-handle_call('get_sec_ping_details', _From, Net) ->
-    ThisNode = get_node(Net),
-    PrimNode = get_node(Net#net.prim, Net),
-    LastRef = case Net#net.hist of
-        [#evt{ref=Ref}|_] -> Ref;
-        []                -> 'undefined'
+handle_call('deactivate', _From, Sd) ->
+    {reply, ok, Sd#sd{init_id = 'undefined', this_id = 'undefined'}};
+
+handle_call('is_active', _From, #sd{this_id=ThisId}=Sd) ->
+    {reply, ThisId =/= 'undefined', Sd};
+
+handle_call(_Msg, _From, Sd) ->
+    {reply, {error, 'undefined'}, Sd}.
+
+%% @private
+handle_cast(_Msg, Sd) ->
+    {noreply, Sd}.
+
+%% @private
+handle_info({'$ttd_timeout', T}, #sd{this_id='undefined', timers=Ts}=Sd) ->
+    {_, Ts1} = hc_timer:del_if_exists(T, Ts),
+    {noreply, Sd#sd{timers = Ts1}};
+
+handle_info({'$ttd_timeout', T}, #sd{timers=Ts}=Sd) ->
+    Sd1 = case hc_timer:del_if_exists(T, Ts) of
+        {true, Ts1} -> handle_ttd_timeout(T, Sd#sd{timers = Ts1});
+        {false, _}  -> Sd
     end,
-    {reply, {ok, {ThisNode, PrimNode, LastRef}}, Net};
-    %% TODO this function should also return the cached custom event that this node wants to cast to the primary node.
+    {noreply, Sd1};
 
-handle_call({'new_remote_evt', Evt}, _From, Net) ->
-%    {Reply, Net1} = handle_raw_event(Evt, Net), TODO FIX THIS
-    {_, Reply, Net1} = process_remote_event(Evt, Net),
-    {reply, Reply, Net1};
+handle_info({'EXIT', Pid, Reason}, Sd) ->
+    case Reason of
+        'normal'        -> ok;
+        'shutdown'      -> ok;
+        {'shutdown', _} -> ok;
+        _               -> ?log_warning("Pid ~p terminated: ~p", [Pid, Reason])
+    end,
+    {noreply, Sd};
 
-handle_call(_Msg, _From, State) ->
-    {reply, 'undefined', State}.
+handle_info(_Msg, Sd) ->
+    {noreply, Sd}.
 
-handle_cast(_Msg, State) ->
-    {noreply, State}.
-
-handle_info(_Msg, State) ->
-    {noreply, State}.
-
-terminate(_Reason, _State) ->
+%% @private
+terminate(_Reason, _Sd) ->
     ok.
 
-code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.
-
+%% @private
+code_change(_OldVsn, Sd, _Extra) ->
+    {ok, Sd}.
 
 %%====================================================================
 %% Internal functions
 %%====================================================================
 
-%% === Utility funs ====
+new_con_pnode(Name, Ttd, Prio, Attribs, Nodes) ->
+    new_pnode(Name, Ttd, Prio, Attribs, true, new_rank(Nodes)).
 
-prop_val(Prop, Ls) ->
-    case lists:keyfind(Prop, 1, Ls) of
-        {_, Val} -> Val;
-        false    -> 'undefined'
-    end.
-
-%TODO client nodes must already filter for bitstrings. This module should no longer do that.
--spec to_list(string() | binary()) -> string().
-to_list(Bin) when is_binary(Bin) -> binary_to_list(Bin);
-to_list(Str)                     -> Str.
-
-reset_state(Net) ->
-    reset_state(Net, 'undefined', []).
-
-reset_state(Net, ThisNode, Nodes) ->
-    Net#net{
-        this_node = ThisNode,
-        nodes     = Nodes,
-        prim      = 'undefined',
-        prim_ex   = [],
-        hist      = [],
-        wait_ev   = []
+edit_pnode(Name, Ttd, Prio, Node) ->
+    Node#pnode{
+        name = Name,
+        ttd  = def_ttd_if_zero(Ttd),
+        prio = Prio
     }.
 
--spec get_secondaries(atom(), [mnode()]) -> [mnode()].
-%% Get all connected secondary nodes
-get_secondaries(Prim, Nodes) ->
-    [N || #mnode{mname=Mn, con=C}=N <- Nodes, C, Mn =/= Prim].
+edit_pnode(Attribs, Node) ->
+    Node#pnode{attribs = attribs_to_bin(Attribs)}.
 
-%% Get node (default: this node) from nodes list
-get_node(#net{this_node=ThisName, nodes=Nodes}) ->
-    get_node(ThisName, Nodes).
+connect_pnode(Name, Ttd, Prio, Attribs, #pnode{local_id=Id}, Nodes) ->
+    new_pnode(Id, Name, Ttd, Prio, Attribs, true, new_rank(Nodes)).
 
-get_node(Name, #net{nodes=Nodes}) ->
-    get_node(Name, Nodes);
-get_node(Name, Nodes) ->
-    case lists:keyfind(Name, #mnode.mname, Nodes) of
-        #mnode{}=N -> N;
-        false      -> 'undefined'
-    end.
+disconnect_pnode(Node) ->
+    Node#pnode{con = false, rank = 0}.
 
-get_this_role(#net{prim='undefined'})          -> ?ROLE_DISC;
-get_this_role(#net{prim=Prim, this_node=Prim}) -> ?ROLE_PRIM;
-get_this_role(#net{})                          -> ?ROLE_SEC.
+new_pnode(Name, Ttd, Prio, Attribs, Con, Rank) ->
+    new_pnode(make_ref(), Name, Ttd, Prio, Attribs, Con, Rank).
 
-
--spec disconnect_network(net()) -> net().
-%% Disconnect from network cluster and reset data.
-%TODO cast to network the node_down event..........................
-% this function should not be here.
-disconnect_network(Net) ->
-    httpcluster_ping:set_role_disc(),
-    httpcluster_timer:stop_all(),
-    reset_state(Net).
-
-
-
-%% === This node connects to httpcluster network ====
-%% (This node transmits init data)
-
--spec this_connect_network(mnode(), [mnode()], net()) -> 
-    {ok, evt() | 'undefined', net()} | 
-    {error, evt_err() | 'already_connected', net()}.
-%% Connect to network by pinging to every node in the given list. 
-%% Then assume either primary or secondary role based on result.
-this_connect_network(#mnode{mname=ThisName}=ThisNode, NodesList, 
-                     #net{prim='undefined', prim_ex=[]}=Net) ->
-    {Nodes, Evt} = cast_node_up_2network(ThisNode, NodesList),
-    process_remote_event(Evt, Net#net{this_node = ThisName, nodes = Nodes});
-this_connect_network(_ThisNode, _NodesList, Net) ->
-    {error, 'already_connected', Net}.
-%TODO perform this check here:
-% is_this_connected(Net)
-
-cast_node_up_2network(ThisNode, NodesList) ->
-    Ns1 = lists:keydelete(ThisNode#mnode.mname, #mnode.mname, NodesList),
-    Evt = single_nodeup_event(ThisNode),
-    Data = mochijson2:encode(
-        apply_handler_fun(
-            ?HANDLER_CREATE_INITDATA, 
-            [Evt, evt2struct(Evt)]
-        )
-    ),
-    case cast_up_seq(Ns1, ThisNode, Data, false) of
-        {ok, {Nodes, [Evt1]}}  -> {Nodes, Evt1};
-        {ok, {Nodes, []}}      -> {Nodes, 'undefined'};
-        {error, 'unreachable'} -> {[], Evt}
-    end.
-
-cast_up_seq([], _,_,_) ->
-    {error, 'unreachable'};
-cast_up_seq([DNode|Tail], ThisNode, Data, IsRedir) ->
-    case apply_handler_fun(?HANDLER_INIT_TO_NODE, [ThisNode, DNode, Data]) of
-        {ok, Bin} ->
-            case apply_handler_fun(
-                ?HANDLER_TRANSLATE_INIT_REPLY,
-                [ThisNode, mochijson2:decode(Bin)]
-            ) of
-                {ok, {_MNodes, _Evts}}=Ok ->
-                    Ok;
-                {'redir', _} when IsRedir ->
-                    cast_up_seq(Tail, ThisNode, Data, false);
-                {'redir', DNode2} ->
-                    cast_up_seq([DNode2|Tail], ThisNode, Data, true);
-                {error, _} ->
-                    cast_up_seq(Tail, ThisNode, Data, false)
-            end;
-        {error, _} ->
-            cast_up_seq(Tail, ThisNode, Data, false)
-    end.
-
-single_nodeup_event(Node) ->
-    #evt{
-        type     = ?EVT_NODE_UP,
-        node_new = #mnode{
-            mname   = Node#mnode.mname,
-            prio    = Node#mnode.prio,
-            ping    = Node#mnode.ping,
-            ttd     = Node#mnode.ttd,
-            attribs = Node#mnode.attribs
-        }
+new_pnode(Id, Name, Ttd, Prio, Attribs, Con, Rank) ->
+    #pnode{
+        local_id = Id,
+        name     = Name,
+        ttd      = def_ttd_if_zero(Ttd),
+        prio     = Prio,
+        attribs  = attribs_to_bin(Attribs),
+        con      = Con,
+        rank     = Rank
     }.
 
+def_ttd_if_zero(0)   -> ?get_env(?DEF_TTD);
+def_ttd_if_zero(Ttd) -> Ttd.
 
-%% === A remote node connects to httpcluster network ====
-%% (This node receives init data)
+attribs_to_bin('undefined') -> 'undefined';
+attribs_to_bin(Attribs)     -> term_to_binary(Attribs).
 
--spec other_connect_network(evt(), net()) -> 
-    {ok, {[mnode()], [evt()]}, net()} |
-    {error, evt_err(), net()} |
-    {'redir', mnode(), net()}.
-%% This node receives data from another node trying to join the network.
-%% If this is the primary node, then reply with a nodes list and echo the
-%% event. If this is secondary or disconnected, reply accordingly.
-other_connect_network(_NodeupEvt, #net{prim='undefined'}=Net) ->
-    {error, 'not_connected', Net};
-other_connect_network(NodeupEvt, #net{prim=Prim, this_node=Prim}=Net) ->
-    case process_remote_event(NodeupEvt, Net) of
-        {ok, Evt, Net1}           -> {ok, {Net#net.nodes, [Evt]}, Net1};
-        {error, 'mnode_up', Net1} -> {ok, {Net#net.nodes, []}, Net1};
-        {error, _,_}=Error        -> Error
-    end;
-other_connect_network(_NodeupEvt, #net{prim=Prim, nodes=Nodes}=Net) ->
-    {'redir', get_node(Prim, Nodes), Net}.
-
-
-%% === 3rd-party initiated events ====
-
--spec manual_event(evt(), net()) ->
-    {ok, evt() | 'evt_waiting', net()} | 
-    {error, evt_err() | 'not_connected', net()}.
-%% Entry point for manually-initiated events by the client. Events are only
-%% accepted this way if this node is connected to the cluster. Otherwise,
-%% this node must first "initiate" the connection before creating events.
-%%
-%% If this is primary, process event right away. Otherwise, put it on wait-list.
-manual_event(Evt, #net{this_node=This, prim=Prim, wait_ev=Evts}=Net) ->
-    case get_this_role(Net) of
-        ?ROLE_PRIM -> process_event(Evt, Net);
-        ?ROLE_SEC  -> {ok, 'evt_waiting', Net#net{wait_ev = [Evt|Evts]}};
-            %TODO or this could be something like httpcluster_ping:add_to_waiting_evts(Evt)
-        ?ROLE_DISC -> {error, 'not_connected', Net}
-    end
-
-
-%% === A remote node connects to httpcluster network ====
-%% (This node receives init data)
-
-
-%% This node received zero or more events from a node within the network. 
-%% The node also gave it's LastRef, indicating how updated its event history is.
-%% If this is the primary node, respond with a list of formalized events
-%% and a list of error messages when applicable.
-%%
-%% If this node is secondary or disconnected, respond accordingly.
-internal_net_events(Evts, LastRef, #net{prim=Prim, this_node=This}=Net) ->
-    case get_this_role(Net) of
-        ?ROLE_PRIM ->
-            {Oks, Errs, Net1} = process_events(Evts, Net),
-            {ok, {Oks, Errs}, Net1};
-        ?ROLE_SEC ->
-        ?ROLE_DISC ->
-    end
-
-% if you go this path, include LastHistRef in both functions. LastHistRef could be 'undefined', as is the case with node_up events. If it is undefined or false, then assume latest events only. i.e. node is fully updated with events.
-%update: LastRef in internal_net_events CANNOT be undefined.
-% external_net_event should also accept an ordered list of events, instead of just a single event.
-
-
--spec external_net_event(evt(), net()) -> 
-    {ok, {[mnode()], [evt()]}, net()} |
-    {error, evt_err(), net()} |
-    {'redir', mnode(), net()}.
-%% This node received an event from a node outside the network.
-%% If this is the primary node, then reply with a nodes list and echo the
-%% (formalized) event. If this is secondary or disconnected, reply accordingly.
-external_net_event(_Evt, #net{prim='undefined'}=Net) ->
-    {error, 'not_connected', Net};
-external_net_event(Evt, #net{prim=Prim, this_node=Prim, nodes=Nodes}=Net) ->
-    case process_event(Evt, Net) of
-        {ok, Evt1, Net1}   -> {ok, {Nodes, [Evt1]}, Net1};
-        {error, _,_}=Error -> Error
-    end;
-external_net_event(_Evt, #net{prim=Prim, nodes=Nodes}=Net) ->
-    {'redir', get_node(Prim, Nodes), Net}.
-
-
-%% === Cluster events handling ====
-
--spec process_events(['undefined' | evt()], net()) -> 
-    {[evt()], [evt_err()], net()}.
-%% Process multiple events.
-%%
-%% NOTE:
-%% Evts list is from-latest-to-earliest. Returned event and evt_err lists 
-%% are likewise ordered. The same ordering is also used for #net.hist.
-process_events(Evts, Net) ->
-    do_process_events(lists:reverse(Evts), [], [], Net).
-
-do_process_events([], Oks, Errs, Net) ->
-    {Oks, Errs, Net};
-do_process_events([Evt|Tail], Oks, Errs, Net) ->
-    case process_event(Evt, Net) of
-        {ok, 'undefined', Net1} -> 
-            do_process_events(Tail, Oks, Errs, Net1);
-        {ok, Evt1, Net1} -> 
-            do_process_events(Tail, [Evt1|Oks], Errs, Net1);
-        {error, Error, Net1} ->
-            do_process_events(Tail, Oks, [Error|Errs], Net1)
-    end.
-
--spec process_event
-(evt(), net())       -> {ok, evt(), net()} | {error, evt_err(), net()};
-('undefined', net()) -> {ok, 'undefined', net()}.
-%% Handles an event that came from the primary node (this node CAN be primary). 
-%% The event goes through validation/etc. if it is an event with an
-%% undefined 'ref' property (i.e., this node IS primary).
-%%
-%% NOTE: checking whether this node is connected, etc. must be done BEFORE
-%% calling this function.
-process_event('undefined', Net) ->
-    {ok, 'undefined', event_net_update('undefined', Net)};
-process_event(Evt, Net) ->
-    case formalize_event(Evt, Net) of
-        {ok, Evt1} ->
-            Net1 = event_net_update(Evt1, Net),
-            httpcluster_subs:broadcast(Evt1),
-            %TODO require: client-provided process to intercept this procedure
-            {ok, Evt1, Net1};
-        {error, Error} ->
-            {error, Error, Net}
-    end.
-
-
-
-do_secmsg_if_prim(#sec_msg{}=Msg, #net{}=Net) ->
-    case get_this_role(Net) of
-        ?ROLE_PRIM ->
-            Res = msg2res(Msg, Net),
-            
-        ?ROLE_SEC -> 
-            redir
-        ?ROLE_DISC -> 
-            {error, 'disconnected', Net}
-    end.
-
-
-
-process_evt_raw(Name, Raw, #net{nodes=Nodes, hist=Hist}=Net) ->
-    case raw2evt(Name, Raw, Nodes, Hist) of
-        #evt{}=Evt ->
-            httpcluster_subs:broadcast(Evt),
-            %TODO require: client-provided process to intercept this procedure
-            %TODO this should be a CAST on httpcluster_subs, too.
-            {Evt, net_update(Evt, Net)};
-        #evt_err{}=Error ->
-            {Error, Net}
-    end.
-
-% DEFUNCTION SECTION START ===================================================
-
-%% === Cluster events handling on Primary Node ====
-% IMPORTANT: primary MUST update process evt() and update the state immediately after converting sec_msg to prim_res. This is to preserve integrity of #evt.time
-
--spec msg2res(sec_msg(), net()) -> prim_res().
-%% Converts a #sec_msg{} to a proper #prim_res{}, 
-%% without affecting local state.
-msg2res(#sec_msg{from=From, evts=Raws, last_evt=Time}=Msg, Net) ->
-    #prim_res{
-        origin = From,
-        evts   = raws2evts(From, lists:reverse(Raws), Net, []) 
-                 ++ get_hist_since(Time, Net#net.hist),
-        nodes  = case Msg#sec_msg.get_nodes of
-                     true  -> Net#net.nodes;
-                     false -> 'undefined'
-                 end
-    }.
-
-%  consider time=0 and time=-1
-get_hist_since(Time, Hist) ->
-    lists:takewhile(
+new_rank(Nodes) ->
+    lists:foldl(
         fun
-            (#evt{time=T1}) when T1 >= Time -> true;
-            (_) -> false
-        end,
-        Hist
+        (#pnode{rank=Rank, con=true}, Acc) when Rank > Acc -> Rank;
+        (#pnode{con=true}, Acc)                            -> Acc;
+        (#pnode{con=false}, Acc)                           -> Acc
+        end, 
+        0, Nodes
+    ) + 1.
+
+pnode_name(#pnode{name=Name}) -> Name;
+pnode_name('undefined')       -> 'undefined'.
+
+from_cnode(Cnode) ->
+    new_pnode(
+        hc_node:name(Cnode), 
+        hc_node:ttd(Cnode), 
+        hc_node:priority(Cnode), 
+        hc_node:attribs(Cnode), 
+        hc_node:is_connected(Cnode), 
+        hc_node:rank(Cnode)
     ).
-% DEFUNCTION SECTION ===================================================
 
-raws2evts(From, [], _Net, Res) ->
-    Res;
-raws2evts(From, [Raw|Tail], #net{nodes=Nodes, hist=Hist}=Net, Res) ->
-    case raw2evt(From, Raw, Nodes, Hist) of
-        #evt{}=Evt ->
-            Net1 = net_soft_update(Evt, Net),
-            raws2evts(From, Tail, Net1, [Evt|Res]);
-        #evt_err{}=Err ->
-            raws2evts(From, Tail, Net, [Err|Res])
+to_cnode(Node) ->
+    hc_node:new(
+        Node#pnode.name,
+        bin_to_attribs(Node#pnode.attribs),
+        Node#pnode.ttd,
+        Node#pnode.prio,
+        Node#pnode.con,
+        Node#pnode.rank
+    ).
+
+bin_to_attribs('undefined') -> 'undefined';
+bin_to_attribs(Bin)         -> binary_to_term(Bin).
+
+get_node(Ident, Nodes) ->
+    case lists:keyfind(Ident, ident_int(Ident), Nodes) of
+        #pnode{}=Node -> Node;
+        false         -> 'undefined'
     end.
 
--spec raw2evt(string(), evt_raw(), [mnode()], [evt()]) -> evt() | evt_err().
-%% Convert an evt_raw{} into a proper evt{}, ready to be applied to cluster.
-raw2evt(From, Raw, Nodes, Hist) ->
-    case formalize_evt_node(From, Raw, Nodes) of
-        #mnode{}=Node1 ->
-            #evt{
-                id        = Raw#evt_raw.id,
-                type      = Raw#evt_raw.type,
-                time      = new_evt_time(),
-                node_name = From,
-                node      = Node1
-            };
-        #evt_err{}=Err ->
-            Err
+take_node(Ident, Nodes) ->
+    case lists:keytake(Ident, ident_int(Ident), Nodes) of
+        {'value', Node, OtherNodes} -> {Node, OtherNodes};
+        false                       -> {'undefined', Nodes}
     end.
 
-formalize_evt_node(From, Raw, Nodes) ->
-    case get_old_mnode(From, Raw, Nodes) of
-        #evt_err{}=Err -> Err;
-        Old            -> form_new_mnode(From, Raw, Old, Nodes)
-    end.
-% DEFUNCTION SECTION ===================================================
-
--spec get_old_mnode(string(), evt_raw(), [mnode()]) -> 
-    'undefined' | mnode() | evt_err().
-%% Get From's original record in the nodes list.
-get_old_mnode(From, #evt_raw{type=T}=R, Nodes) ->
-    Bool = (T =:= ?EVT_NODE_UP),
-    case get_node(From, Nodes) of
-        'undefined' when Bool -> 
-            'undefined';
-        'undefined' -> 
-            evt_err_from_raw(From, R, ?EVT_ERR_NOT_FOUND);
-        #mnode{con=true} when Bool -> 
-            evt_err_from_raw(From, R, ?EVT_ERR_UP);
-        #mnode{con=true}=Node -> 
-            Node;
-        #mnode{con=false}=Node when Bool ->
-            Node;
-        #mnode{con=false} -> 
-            evt_err_from_raw(From, R, ?EVT_ERR_DOWN)
+ident_int(Ident) ->
+    case is_local_id(Ident) of
+        true  -> #pnode.local_id;
+        false -> #pnode.name
     end.
 
--spec form_new_mnode(string(), evt_raw(), 'undefined' | mnode(), [mnode()]) -> 
-    mnode() | evt_err().
-%% Form From's new node record.
-form_new_mnode(From, #evt_raw{type=?EVT_NODE_UP, node=N}, _, Nodes) ->
-    new_connected_mnode(From, N, Nodes);
-form_new_mnode(_, #evt_raw{type=?EVT_NODE_DOWN}, Old, _) ->
-    Old#mnode{con = false, rank = 0};
-form_new_mnode(From, #evt_raw{type=?EVT_NODE_EDIT, node=N}=R, Old, Nodes) ->
-    case is_dup_mname(Old#mnode.name, N#mnode.name, Nodes) of
-        true  -> evt_err_from_raw(From, R, ?EVT_ERR_ALREADY_EXISTS);
-        false -> edit_connected_mnode(Old, N)
-    end;
-form_new_mnode(_, #evt_raw{type=_, node=N}, Old, Nodes) ->
-    Old#mnode{attribs = N#mnode.attribs}.
-% DEFUNCTION SECTION ===================================================
+% A weak function
+is_local_id(Id) when is_reference(Id) -> true;
+is_local_id(_)                        -> false.
 
-new_connected_mnode(From, #mnode{ping=Ping, ttd=TTD}=Node, Nodes) ->
-    Node#mnode{
-        name = From,
-        con  = true,
-        rank = new_node_rank(Nodes),
-        ping = def_if_zero(Ping, ?DEF_PING),
-        ttd  = def_if_zero(TTD, ?DEF_TTD)
-    }.
+store_node('undefined', Nodes)   -> Nodes;
+store_node(#pnode{}=Node, Nodes) -> [Node|Nodes].
+%% -----------------
 
-edit_connected_mnode(Old, New) ->
-    Old#mnode{
-        name = New#mnode.name,
-        prio = New#mnode.prio,
-        ping = def_if_zero(New#mnode.ping, ?DEF_PING),
-        ttd  = def_if_zero(New#mnode.ttd, ?DEF_TTD)
-    }.
+%% When a node_ping() is received from a remote node, it will be checked
+%% for validity. If so, and the result of processing it is an evt() or 
+%% an evt_err(), then a node_pong() will be created both as a reply,
+%% and a broadcast to all other live nodes. 
+%%
+%% The broadcasted node_pong() in this case will never be a sync (i.e.,
+%% containing a non-undefined 'nodes' property) even if the original
+%% node_ping() was.
+%%
+%% If the result of processing the node_ping() was an node_reply(), then
+%% no broadcast will happen.
+%%
+%% If a soft init is triggered, server will only respond to a ping that
+%% contains a nodeup event from self node.
+-spec handle_node_ping(Ping, From, Sd1) -> Sd2
+    when
+        Ping :: hc_evt:node_ping(),
+        From :: term(),
+        Sd1  :: sd(),
+        Sd2  :: sd().
+handle_node_ping(Ping, From, #sd{init_id=Init, this_id=This, nodes=Nodes}=Sd) ->
+    case {Init, This} of
+        {'undefined', 'undefined'} ->
+            dont_handle_node_ping(Ping, From, Sd);
+        {_, 'undefined'} ->
+            #pnode{name=Name} = get_node(Init, Nodes),
+            case is_nodeup4(Name, Ping) of
+                true  -> do_handle_node_ping(Init, Ping, From, Sd);
+                false -> dont_handle_node_ping(Ping, From, Sd)
+            end;
+        {_,_} ->
+            do_handle_node_ping(This, Ping, From, Sd)
+    end.
 
-def_if_zero(0, Var) -> get_app_var(Var);
-def_if_zero(Num, _) -> Num.
+dont_handle_node_ping(Ping, From, Sd) ->
+    proc_lib:spawn_link(
+        ?MODULE, 'reply_with_node_reply_error',
+        [hc_evt:node_com_id(Ping), 'not_primary',
+         hc_evt:node_com_destination(Ping), hc_evt:node_com_source(Ping),
+         Sd#sd.nodes, From]
+    ),
+    Sd.
 
-evt_err_from_raw(From, Raw, Reason) ->
-    #evt_err{
-        id        = Raw#evt_raw.id,
-        type      = Raw#evt_raw.type,
-        time      = new_evt_time(),
-        node_name = From,
-        reason    = Reason
-    }.
+do_handle_node_ping(ThisId, Ping, From, #sd{nodes=Nodes}=Sd) ->
+    PingId = hc_evt:node_com_id(Ping),
+    PingSource = hc_evt:node_com_source(Ping),
+    #pnode{name=ThisNameOrig} = get_node(ThisId, Nodes),
+    case hc_evt:node_com_destination(Ping) of
+        ThisNameOrig ->
+            % Process the valid ping that may or may not contain a raw.
+            {{Evt, _}=Tuple, #sd{nodes=Nodes1}=Sd1} = handle_raw_from_node(
+                PingSource, hc_evt:node_ping_raw(Ping), 
+                hc_evt:node_ping_sync(Ping), Sd
+            ),
+            % Reply back with the result.
+            proc_lib:spawn_link(
+                ?MODULE, 'reply_with_node_pong_ok',
+                [PingId, Tuple, {ThisId, ThisNameOrig},
+                 PingSource, Nodes1, From]
+            ),
+            % Dessiminate the event to other nodes if applicable.
+            node_cast(Evt, ThisId, Nodes1),
+            Sd1;
+        _ ->
+            proc_lib:spawn_link(
+                ?MODULE, 'reply_with_node_reply_error',
+                [PingId, 'invalid_destination', 
+                 ThisId, PingSource, Nodes, From]
+            ),
+            Sd
+    end.
 
-new_evt_time() ->
+node_cast('undefined', _ThisId, _Nodes) ->
+    ok;
+node_cast(Evt, ThisId, Nodes) ->
+    proc_lib:spawn_link(?MODULE, 'cast_node_pong', [Evt, ThisId, Nodes]).
+
+is_nodeup4(Name, Ping) ->
+    (hc_evt:node_com_source(Ping) =:= Name) andalso 
+    (hc_evt:type(hc_evt:node_ping_raw(Ping)) =:= ?EVT_NODE_UP).
+
+%% @private
+%% @doc Create and broadcast a node_pong(). Create a node_pong()
+%%      record containing `Evt' and send it to all connected 
+%%      nodes except for this node and the subject node of `Evt'.
+-spec 'cast_node_pong'(Evt, ThisId, Nodes) -> _
+    when
+        Evt    :: hc_evt:evt(),
+        ThisId :: local_id(),
+        Nodes  :: [pnode()].
+'cast_node_pong'(Evt, ThisId, Nodes) ->
+    proc_lib:init_ack({ok, self()}),
+    PongId = hc_evt:random_str(8),
+    XNode = get_node(hc_node:name(hc_evt:cnode(Evt)), Nodes),
+    {ThisNode, OtherNodes} = take_node(ThisId, Nodes),
+    Tuple = {
+        ThisNode#pnode.name, 
+        to_cnode(ThisNode), 
+        [to_cnode(Node) || Node <- OtherNodes]
+    },
+    [cast_pongdata(PongId, Evt, Tuple, N) || 
+        N <- OtherNodes,
+        N#pnode.con,
+        N#pnode.local_id =/= XNode#pnode.local_id].
+
+cast_pongdata(
+    PongId, Evt, {SourceName, SourceCnode, OtherCnodes}, 
+    #pnode{name=DestName}=DestNode
+) ->
+    NodePong = hc_evt:new_node_pong(
+        PongId, SourceName, DestName, Evt, 'undefined'
+    ),
+    ?apply_coms_fun(
+        ?HANDLER_PONG_TO_NODE,
+        [
+            ?apply_coms_fun(
+                ?HANDLER_CREATE_PONGDATA,
+                [NodePong, SourceCnode, OtherCnodes]
+            ),
+            SourceCnode, to_cnode(DestNode)
+        ]
+    ).
+
+%% @private
+%% @doc Create and serialize a {@link hc_evt:node_reply()} containing 
+%%      an error message using the client comms module.
+%%      Meant to be called as a separate process not only to be safe, but to
+%%      prevent race conditions as well.
+-spec 'reply_with_node_reply_error'(ComId, Reason, Source, Dest, Nodes, From) ->
+    _
+    when
+        ComId  :: string(),
+        Reason :: term(),
+        Source :: hc_node:name() | local_id(),
+        Dest   :: hc_node:name(),
+        Nodes  :: [pnode()],
+        From   :: term().
+'reply_with_node_reply_error'(ComId, Reason, Source, Dest, Nodes, From) ->
+    proc_lib:init_ack({ok, self()}),
+    SourceName = case is_local_id(Source) of
+        true  -> #pnode{name=Name}=get_node(Source, Nodes), Name;
+        false -> Source
+    end,
+    NodeReply = hc_evt:new_node_reply(ComId, SourceName, Dest, {error, Reason}),
+    create_pongdata_then_reply(NodeReply, Source, Nodes, From).
+
+%% @private
+%% @doc Create and serialize a {@link hc_evt:node_pong()} 
+%%      using the client comms module.
+%%      Meant to be called as a separate process not only to be safe, but to
+%%      prevent race conditions as well.
+-spec 'reply_with_node_pong_ok'(
+    ComId, {ComEvt, ComCnodes}, {SourceId, SourceName}, Dest, Nodes, From
+) -> _
+    when
+        ComId      :: string(),
+        ComEvt     :: 'undefined' | hc_evt:evt() | hc_evt:evt_err(),
+        ComCnodes  :: 'undefined' | hc_node:cnodes(),
+        SourceId   :: local_id(),
+        SourceName :: hc_node:name(),
+        Dest       :: hc_node:name(),
+        Nodes      :: [pnode()],
+        From       :: term().
+'reply_with_node_pong_ok'(
+    ComId, {ComEvt, ComCnodes}, {SourceId, SourceName}, Dest, Nodes, From
+) ->
+    proc_lib:init_ack({ok, self()}),
+    NodePong = hc_evt:new_node_pong(ComId, SourceName, Dest, ComEvt, ComCnodes),
+    create_pongdata_then_reply(NodePong, SourceId, Nodes, From).
+
+create_pongdata_then_reply(NodeCom, Source, Nodes, From) ->
+    {SourceCnode, OtherCnodes} = case is_local_id(Source) of
+        true -> 
+            {N, Ns} = take_node(Source, Nodes),
+            {to_cnode(N), [to_cnode(Nx) || Nx <- Ns]};
+        false ->
+            {hc_node:new(Source, 'undefined'), hc_node:empty()}
+    end,
+    Data = ?apply_coms_fun(
+        ?HANDLER_CREATE_PONGDATA, [NodeCom, SourceCnode, OtherCnodes]
+    ),
+    gen_server:reply(From, {ok, Data}).
+%% -----------------
+
+%% Process a given evt_raw (ReqRaw) from a node (ReqNodeName)
+%% into the server state data and return the resulting evt or evt_err.
+%% Also return the current Nodes list if ReqDoSync is true.
+-spec handle_raw_from_node(ReqNodeName, ReqRaw, ReqDoSync, Sd) ->
+    {{Evt, Nodes}, Sd1}
+    when
+        ReqNodeName :: hc_node:name(),
+        ReqRaw      :: 'undefined' | hc_evt:evt_raw(),
+        ReqDoSync   :: boolean(),
+        Sd          :: sd(),
+        Evt         :: 'undefined' | hc_evt:evt() | hc_evt:evt_err(),
+        Nodes       :: 'undefined' | hc_node:cnodes(),
+        Sd1         :: sd().
+handle_raw_from_node(
+    ReqNodeName, ReqRaw, ReqDoSync,
+    #sd{nodes=Nodes, evts=Evts, timers=Timers}=Sd
+) ->
+    log_if_defined(
+        ReqRaw, "Begin processing evt_raw from ~p: ~p", [ReqNodeName, ReqRaw]
+    ),
+    Tuple = {Evt, _,_} = process_raw(
+        {ReqNodeName, ReqRaw}, get_last_evtid(Evts), Nodes, Timers
+    ),
+    log_if_defined(
+        Evt, "Done processing evt_raw from ~p: ~p", [ReqNodeName, Evt]
+    ),
+    Return = {Evt, undef_or_cnodes(ReqDoSync, Nodes)},
+    {Return, update_sd(Tuple, Sd)}.
+
+log_if_defined('undefined', _,_) -> ok;
+log_if_defined(_, Format, Args)  -> ?log_debug(Format, Args).
+
+get_last_evtid([])      -> 0;
+get_last_evtid([Evt|_]) -> hc_evt:id(Evt).
+
+undef_or_cnodes(true, Nodes) -> 
+    hc_node:list_to_cnodes([to_cnode(Node) || Node <- Nodes]);
+undef_or_cnodes(false, _) -> 
+    'undefined'.
+
+%% Fires an automatic NODE_DOWN on a node that times out on its TTD.
+-spec handle_ttd_timeout(Timer, Sd) -> Sd1
+    when
+        Timer :: hc_timer:timer(), 
+        Sd    :: sd(),
+        Sd1   :: sd().
+handle_ttd_timeout(Timer, #sd{nodes=Nodes, evts=Evts, timers=Timers}=Sd) ->
+    % Include an additional check to make sure no NODE_DOWN 
+    % evts are created for non-existing nodes.
+    Ident = hc_timer:ident(Timer),
+    case get_node(Ident, Nodes) of
+        'undefined' ->
+            Sd;
+        Node ->
+            Tuple = process_raw(
+                {Ident, nodedown_raw("ttd_timeout_", Node)},
+                get_last_evtid(Evts), Nodes, Timers
+            ),
+            update_sd(Tuple, Sd)
+    end.
+
+nodedown_raw(Prefix, Node) ->
+    hc_evt:new_raw(
+        Prefix ++ Node#pnode.name, 
+        ?EVT_NODE_DOWN, 
+        to_cnode(disconnect_pnode(Node))
+    ).
+%% -----------------
+
+%% Do the thing!
+-spec process_raw({NodeIdent, Raw}, LastEvtId, Nodes, Timers) ->
+    {Evt, Nodes1, Timers1}
+    when
+        NodeIdent :: hc_node:name() | local_id(),
+        Raw       :: 'undefined' | hc_evt:evt_raw(),
+        LastEvtId :: 0 | hc_evt:id(),
+        Nodes     :: [pnode()],
+        Timers    :: hc_timer:timers(),
+        Evt       :: 'undefined' | hc_evt:evt() | hc_evt:evt_err(),
+        Nodes1    :: [pnode()],
+        Timers1   :: hc_timer:timers().
+process_raw({NodeIdent, Raw}, LastEvtId, Nodes, Timers) ->
+    {Node, OtherNodes} = take_node(NodeIdent, Nodes),
+    {Node1, Evt1, Timers1} = raw2evt_with_timer_triggers(
+        Node, OtherNodes, LastEvtId, Raw, Timers
+    ),
+    Nodes1 = store_node(Node1, OtherNodes),
+    {Evt1, Nodes1, Timers1}.
+
+raw2evt_with_timer_triggers(OldNode, _,_, 'undefined', Timers) ->
+    {OldNode, 'undefined', trigger_timer(OldNode, Timers, true)};
+raw2evt_with_timer_triggers(OldNode, OtherNodes, LastEvtId, Raw, Timers) ->
+    % Refresh timer as a first step just in case processing the raw
+    % will take a longer time than expected. 
+    %
+    % SemiNewTimers should be exactly the same as Timers.
+    SemiNewTimers = trigger_timer(OldNode, Timers, false),
+    {NewNode, NewEvt} = raw2evt(OldNode, OtherNodes, LastEvtId, Raw),
+    % This time, if the node went down, turn off the timer.
+    % If it went up, turn on the timer.
+    % If it stayed up, the timer may be refreshed twice in 
+    % rapid succession, which is ok.
+    NewTimers = trigger_timer(NewNode, SemiNewTimers, true),
+    {NewNode, NewEvt, NewTimers}.
+
+trigger_timer('undefined', Timers, _) ->
+    Timers;
+trigger_timer(#pnode{local_id=Id, ttd=Ttd, con=true}, Timers, _) ->
+    hc_timer:sec_disc_on(Id, Ttd + ?get_env(?TTD_DELAY), Timers);
+trigger_timer(#pnode{local_id=Id, con=false}, Timers, true) ->
+    hc_timer:sec_disc_off(Id, Timers);
+trigger_timer(#pnode{con=false}, Timers, false) ->
+    Timers.
+
+update_sd({Evt, Nodes, Timers}, #sd{evts=Evts}=Sd) ->
+    update_sd(update_evts(Evt, Evts), Nodes, Timers, Sd).
+
+update_sd(Evts, Nodes, Timers, Sd) ->
+    Sd#sd{evts = hc_evt:truncate_evts(Evts), nodes = Nodes, timers = Timers}.
+
+update_evts('undefined', Evts) -> Evts;
+update_evts(Evt, Evts)         -> [Evt|Evts].
+
+%% Convert an evt_raw() into either an evt() (successfully processed) 
+%% or an evt_err() (error during processing). Also returns the
+%% resulting pnode() after processing.
+-spec raw2evt(OldNode, OtherNodes, LastId, Raw) -> 
+    {NewNode, Evt} | {OldNode, Err}
+    when
+        OldNode    :: pnode() | 'undefined',
+        NewNode    :: pnode(),
+        OtherNodes :: [pnode()],
+        LastId     :: non_neg_integer(),
+        Raw        :: hc_evt:evt_raw(),
+        Evt        :: hc_evt:evt(),
+        Err        :: hc_evt:evt_err().
+raw2evt(OldNode, OtherNodes, LastId, Raw) ->
+    NewId = LastId + 1,
+    Type  = hc_evt:type(Raw),
+    Time  = now_in_sec(),
+    case check_rawtype(Type, OldNode) of
+        ok ->
+            RawNode = hc_evt:cnode(Raw),
+            case form_newnode(OldNode, OtherNodes, RawNode, Type) of
+                {ok, NewNode} ->
+                    {NewNode, hc_evt:new_evt_from_raw(
+                        NewId, Time, pnode_name(OldNode), 
+                        to_cnode(NewNode), Raw
+                    )};
+                {error, Error} ->
+                    {OldNode, hc_evt:new_evt_err_from_raw(
+                        NewId, Time, Error, Raw
+                    )}
+            end;
+        {error, Error} ->
+            {OldNode, hc_evt:new_evt_err_from_raw(NewId, Time, Error, Raw)}
+    end.
+
+now_in_sec() ->
     calendar:datetime_to_gregorian_seconds(calendar:universal_time()).
 
-new_node_rank(Nodes) ->
-    1 + lists:max([Rank || #mnode{rank=Rank, con=Con} <- Nodes, Con]).
+%% Check if a raw event's type is valid given the current 
+%% state of the node in question.
+-spec check_rawtype(Type, Node) -> Result
+    when
+        Type   :: hc_evt:type(),
+        Node   :: pnode() | 'undefined',
+        Result :: ok | {error, hc_evt:err_reason()}.
+check_rawtype(?EVT_NODE_UP, 'undefined')       -> ok;
+check_rawtype(_, 'undefined')                  -> {error, ?EVT_ERR_NOT_FOUND};
+check_rawtype(?EVT_NODE_UP, #pnode{con=true})  -> {error, ?EVT_ERR_UP};
+check_rawtype(_, #pnode{con=true})             -> ok;
+check_rawtype(?EVT_NODE_UP, #pnode{con=false}) -> ok;
+check_rawtype(_, #pnode{con=false})            -> {error, ?EVT_ERR_DOWN}.
 
-is_dup_mname(OrigName, NewName, Nodes) ->
-    lists:any(fun(#mnode{name=NameX, con=ConX}) ->
-        case NameX of NewName when ConX -> true; _ -> false end
-    end, lists:keydelete(OrigName, #mnode.name, Nodes)).
+%% Create/modify the new state of the node. 
+%% Check for duplicate names when applicable.
+-spec form_newnode(OldNode, OtherNodes, RawNode, Type) -> 
+    {ok, NewNode} | {error, Error}
+    when
+        OldNode    :: pnode() | 'undefined',
+        OtherNodes :: [pnode()],
+        RawNode    :: hc_node:cnode(),
+        Type       :: hc_evt:type(),
+        NewNode    :: pnode(),
+        Error      :: hc_evt:err_reason().
+form_newnode(OldNode, OtherNodes, RawNode, ?EVT_NODE_UP) ->
+    Rname = hc_node:name(RawNode),
+    Rttd  = hc_node:ttd(RawNode),
+    Rprio = hc_node:priority(RawNode),
+    Ratt  = hc_node:attribs(RawNode),
+    case is_dup_name(RawNode, OtherNodes) of
+        true -> 
+            {error, ?EVT_ERR_ALREADY_EXISTS};
+        false when OldNode =:= 'undefined' -> 
+            {ok, new_con_pnode(Rname, Rttd, Rprio, Ratt, OtherNodes)};
+        false ->
+            {ok, connect_pnode(Rname, Rttd, Rprio, Ratt, OldNode, OtherNodes)}
+    end;
+form_newnode(OldNode, OtherNodes, RawNode, ?EVT_NODE_EDIT) ->
+    case is_dup_name(RawNode, OtherNodes) of
+        true -> 
+            {error, ?EVT_ERR_ALREADY_EXISTS};
+        false -> 
+            {ok, edit_pnode(
+                hc_node:name(RawNode), 
+                hc_node:ttd(RawNode), 
+                hc_node:priority(RawNode), 
+                OldNode
+            )}
+    end;
+form_newnode(OldNode, _,_, ?EVT_NODE_DOWN) ->
+    {ok, disconnect_pnode(OldNode)};
+form_newnode(OldNode, _, RawNode, _) ->
+    {ok, edit_pnode(hc_node:attribs(RawNode), OldNode)}.
 
-% DEFUNCTION SECTION END ======================================================
+is_dup_name(HcNode, Nodes) ->
+    Name = hc_node:name(HcNode),
+    lists:any(
+        fun (#pnode{name=Pname, con=Con}) -> Con andalso (Pname =:= Name) end,
+        Nodes
+    ).
 
+%%====================================================================
+%% Tests
+%%====================================================================
 
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
 
+raw2evt_test_() ->
+    {'foreach',
+     fun setup/0,
+     fun cleanup/1,
+     [fun from_undef_2_up/1,
+      fun from_undef_2_up_dupname/1,
+      fun from_undef_2_down/1,
+      fun from_undef_2_edit/1,
+      fun from_undef_2_edit_dupname/1,
+      fun from_undef_2_custom/1,
+      fun from_up_2_up/1,
+      fun from_up_2_up_diffname/1,
+      fun from_up_2_up_dupname/1,
+      fun from_up_2_down/1,
+      fun from_up_2_edit/1,
+      fun from_up_2_edit_diffname/1,
+      fun from_up_2_edit_dupname/1,
+      fun from_up_2_edit_dupname_disc/1,
+      fun from_up_2_custom/1,
+      fun from_down_2_up/1,
+      fun from_down_2_up_diffname/1,
+      fun from_down_2_up_dupname/1,
+      fun from_down_2_down/1,
+      fun from_down_2_edit/1,
+      fun from_down_2_custom/1]}.
 
+setup() ->
+    [new_pnode("node-a", 180000, 5, {'name', "node-a"}, true, 1),
+     new_pnode("node-b", 180000, 5, {'name', "node-b"}, true, 3),
+     new_pnode("node-c", 180000, 5, {'name', "node-c"}, false, 0),
+     new_pnode("node-d", 180000, 5, {'name', "node-d"}, true, 2)].
 
-%% === Refresh/update cluster values ====
-
-%------------- is this useful?? ---------------
--spec net_updates([evt() | evt_err()], net()) -> {net(), [evt_err()]}.
-net_updates(NodeEvts, Net) ->
-    {Evts, Errs} = lists:partition(
-        fun(#evt{}) -> true; (#evt_err{}) -> false end, 
-        NodeEvts
-    ),
-    {iter_net_update(Evts, Net), Errs}.
-
-iter_net_update([Evt|Tail], Net) -> iter_net_update(Tail, net_update(Evt, Net));
-iter_net_update([], Net)         -> Net.
-% ----------------------------------------------------
-
-
-            httpcluster_subs:broadcast(Evt),
-            %TODO require: client-provided process to intercept this procedure
-            %TODO this should be a CAST on httpcluster_subs, too.
-            {Evt, net_update(Evt, Net)};
--spec net_soft_update(evt(), net()) -> net().
-%% Update state without triggering role changes. 
-%TODO hist is not necessary here
-net_soft_update(Evt, #net{this_node=This, nodes=Nodes, hist=Hist}=Net) ->
-    {Nodes1, Hist1} = update_nodes_hist(Evt, Nodes, Hist),
-    Net#net{
-        nodes = Nodes1,
-        hist  = Hist1,
-        prim  = update_primary_name(This, Nodes1)
-    }.
-
--spec net_update(evt(), net()) -> net().
-%% Update the network state and renew node role.
-net_update(Evt, #net{nodes=Nodes, hist=Hist}=Net) ->
-    {Nodes1, Hist1} = update_nodes_hist(Evt, Nodes, Hist),
-    net_update(Net#net{
-        nodes = Nodes1,
-        hist  = Hist1
-    }).
-
--spec net_update(net()) -> net().
-%% Renew node role.
-net_update(#net{this_node=This, nodes=Nodes}=Net) ->
-    Net1 = Net#net{prim = update_primary_name(This, Nodes)},
-    trigger_role(Net1),
-    Net1.
-
-update_nodes_hist(#evt{node_name=Name, node=Node}=Evt, Nodes, Hist) ->
-    {
-        lists:keystore(Name, #mnode.name, Nodes, Node), 
-        lists:sublist([Evt|Hist], get_app_var(?HIST_LEN))
-    }.
-
-refresh_primary_name(This, Nodes, _PrimEx) ->
-    case get_node(This, Nodes) of
-        #mnode{con=true}  ->
-            #mnode{mname=Prim} = generate_primary('undefined', Nodes),
-            Prim;
-        #mnode{con=false} ->
-            'undefined'
-    end.
-% TODO consider prim_ex list....
-
-generate_primary(Prim, []) ->
-    Prim;
-generate_primary(Prim, [#mnode{con=false}|Tail]) ->
-    generate_primary(Prim, Tail);
-generate_primary('undefined', [Node|Tail]) ->
-    generate_primary(Node, Tail);
-generate_primary(#mnode{prio=P}=Prim, [#mnode{prio=N}|Tail]) when N > P ->
-    generate_primary(Prim, Tail);
-generate_primary(#mnode{prio=P}, [#mnode{prio=N}=Node|Tail]) when N < P ->
-    generate_primary(Node, Tail);
-generate_primary(#mnode{rank=P}=Prim, [#mnode{rank=N}|Tail]) when N > P ->
-    generate_primary(Prim, Tail);
-generate_primary(#mnode{rank=P}, [#mnode{rank=N}=Node|Tail]) when N < P ->
-    generate_primary(Node, Tail).
-
-
-%% === Assume node role, or abandon/disconnect role ====
-
--spec trigger_role(net()) -> _.
-%% Evaluate this node's role and trigger the different corresponding
-%% functions accordingly. Those functions MUST be idempotent.
-% TODO-------------------------
-trigger_role(#net{this_node=Prim, prim=Prim, nodes=Nodes}) ->
-    %% PRIMARY NODE ROLE
-    %TODO -------------------------------------
-    httpcluster_timer:start_sec(get_secondaries(Prim, Nodes)), %TODO this must be converted into a function that starts a timer for each currently secondary node, and terminates all others.
-    %httpcluster_ping:set_role_prim(), TODO this function should be implemented as a way of checking httpcluster_ping if it's still running secondary routines.
-    % yeah..................do that.
-    % i.e. each set_role_xxx must terminate all routines from other roles
-    ok;
-trigger_role(#net{}=Net) ->
-    %% SECONDARY NODE ROLE
-    ThisNode = get_node(Net),
-    httpcluster_ping:set_role_sec(ThisNode#mnode.ping),
+cleanup(_) ->
     ok.
 
+new_raw(RawName, Type, NodeName, Attribs, Ttd, Prio, Con, Rank) ->
+    hc_evt:new_raw(
+        RawName, Type,
+        hc_node:new(NodeName, Attribs, Ttd, Prio, Con, Rank)
+    ).
 
+type_orgname(E) ->
+    case hc_evt:is_evt(E) of
+        true  -> {hc_evt:type(E), hc_evt:org_name(E)};
+        false -> 'undefined'
+    end.
 
+type_reason(E) ->
+    case hc_evt:is_evt(E) of
+        true  -> 'undefined';
+        false -> {hc_evt:type(E), hc_evt:reason(E)}
+    end.
 
+from_undef_2_up(Nodes) ->
+    {_, Evt} = raw2evt(
+        'undefined',
+        Nodes, 0,
+        new_raw(
+            "evtid", ?EVT_NODE_UP, "node-e", 
+            {'name', "node-e"}, 60000, 5, true, 0
+        )
+    ),
+    [?_assertMatch({?EVT_NODE_UP, 'undefined'}, type_orgname(Evt)),
+     ?_assert(hc_node:is_connected(hc_evt:cnode(Evt)))].
 
+from_undef_2_up_dupname(Nodes) ->
+    {_, Evt} = raw2evt(
+        'undefined',
+        Nodes, 0,
+        new_raw(
+            "evtid", ?EVT_NODE_UP, "node-a", 
+            {'name', "node-a"}, 60000, 5, true, 0
+        )
+    ),
+    [?_assertMatch({?EVT_NODE_UP, ?EVT_ERR_ALREADY_EXISTS}, type_reason(Evt))].
 
+from_undef_2_down(Nodes) ->
+    {_, Evt} = raw2evt(
+        'undefined',
+        Nodes, 0,
+        new_raw(
+            "evtid", ?EVT_NODE_DOWN, "node-e", 
+            {'name', "node-e"}, 60000, 5, false, 0
+        )
+    ),
+    [?_assertMatch({?EVT_NODE_DOWN, ?EVT_ERR_NOT_FOUND}, type_reason(Evt))].
 
+from_undef_2_edit(Nodes) ->
+    {_, Evt} = raw2evt(
+        'undefined',
+        Nodes, 0,
+        new_raw(
+            "evtid", ?EVT_NODE_EDIT, "node-e", 
+            {'name', "node-e"}, 160000, 5, true, 4
+        )
+    ),
+    [?_assertMatch({?EVT_NODE_EDIT, ?EVT_ERR_NOT_FOUND}, type_reason(Evt))].
+
+from_undef_2_edit_dupname(Nodes) ->
+    {_, Evt} = raw2evt(
+        'undefined',
+        Nodes, 0,
+        new_raw(
+            "evtid", ?EVT_NODE_EDIT, "node-a", 
+            {'name', "node-a"}, 160000, 5, true, 4
+        )
+    ),
+    [?_assertMatch({?EVT_NODE_EDIT, ?EVT_ERR_NOT_FOUND}, type_reason(Evt))].
+
+from_undef_2_custom(Nodes) ->
+    {_, Evt} = raw2evt(
+        'undefined',
+        Nodes, 0,
+        new_raw(
+            "evtid", "custom_evt", "node-e", 
+            {'prop', "val"}, 60000, 5, true, 4
+        )
+    ),
+    [?_assertMatch({"custom_evt", ?EVT_ERR_NOT_FOUND}, type_reason(Evt))].
+
+from_up_2_up(Nodes) ->
+    {_, Evt} = raw2evt(
+        new_pnode(
+            "node-e", 160000, 5, {'name', "node-e"}, true, 4
+        ),
+        Nodes, 0,
+        new_raw(
+            "evtid", ?EVT_NODE_UP, "node-e", 
+            {'name', "node-e"}, 160000, 5, true, 0
+        )
+    ),
+    [?_assertMatch({?EVT_NODE_UP, ?EVT_ERR_UP}, type_reason(Evt))].
+
+from_up_2_up_diffname(Nodes) ->
+    {_, Evt} = raw2evt(
+        new_pnode(
+            "node-e", 160000, 5, {'name', "node-e"}, true, 4
+        ),
+        Nodes, 0,
+        new_raw(
+            "evtid", ?EVT_NODE_UP, "node-f", 
+            {'name', "node-f"}, 30000, 5, true, 0
+        )
+    ),
+    [?_assertMatch({?EVT_NODE_UP, ?EVT_ERR_UP}, type_reason(Evt))].
+
+from_up_2_up_dupname(Nodes) ->
+    {_, Evt} = raw2evt(
+        new_pnode(
+            "node-e", 160000, 5, {'name', "node-e"}, true, 4
+        ),
+        Nodes, 0,
+        new_raw(
+            "evtid", ?EVT_NODE_UP, "node-a", 
+            {'name', "node-a"}, 160000, 5, true, 0
+        )
+    ),
+    [?_assertMatch({?EVT_NODE_UP, ?EVT_ERR_UP}, type_reason(Evt))].
+
+from_up_2_down(Nodes) ->
+    {_, Evt} = raw2evt(
+        new_pnode(
+            "node-e", 160000, 5, {'name', "node-e"}, true, 4
+        ),
+        Nodes, 0,
+        new_raw(
+            "evtid", ?EVT_NODE_DOWN, "node-e", 
+            {'name', "node-e"}, 160000, 5, false, 0
+        )
+    ),
+    [?_assertMatch({?EVT_NODE_DOWN, _}, type_orgname(Evt)),
+     ?_assertNot(hc_node:is_connected(hc_evt:cnode(Evt)))].
+
+from_up_2_edit(Nodes) ->
+    {_, Evt} = raw2evt(
+        new_pnode(
+            "node-e", 160000, 5, {'name', "node-e"}, true, 4
+        ),
+        Nodes, 0,
+        new_raw(
+            "evtid", ?EVT_NODE_EDIT, "node-e", 
+            {'name', "node-e"}, 160000, 5, true, 0
+        )
+    ),
+    [?_assertMatch({?EVT_NODE_EDIT, _}, type_orgname(Evt)),
+     ?_assertEqual("node-e", hc_node:name(hc_evt:cnode(Evt))),
+     ?_assert(hc_node:is_connected(hc_evt:cnode(Evt)))].
+
+from_up_2_edit_diffname(Nodes) ->
+    {_, Evt} = raw2evt(
+        new_pnode(
+            "node-e", 160000, 5, {'name', "node-e"}, true, 4
+        ),
+        Nodes, 0,
+        new_raw(
+            "evtid", ?EVT_NODE_EDIT, "node-f", 
+            {'name', "node-f"}, 90000, 3, true, 0
+        )
+    ),
+    [?_assertMatch({?EVT_NODE_EDIT, _}, type_orgname(Evt)),
+     ?_assertEqual("node-f", hc_node:name(hc_evt:cnode(Evt))),
+     ?_assertEqual({'name', "node-e"}, hc_node:attribs(hc_evt:cnode(Evt))),
+     ?_assert(hc_node:is_connected(hc_evt:cnode(Evt)))].
+
+from_up_2_edit_dupname(Nodes) ->
+    {_, Evt} = raw2evt(
+        new_pnode(
+            "node-e", 160000, 5, {'name', "node-e"}, true, 4
+        ),
+        Nodes, 0,
+        new_raw(
+            "evtid", ?EVT_NODE_EDIT, "node-a", 
+            {'name', "node-a"}, 90000, 3, true, 0
+        )
+    ),
+    [?_assertMatch(
+        {?EVT_NODE_EDIT, ?EVT_ERR_ALREADY_EXISTS}, type_reason(Evt)
+    )].
+
+from_up_2_edit_dupname_disc(Nodes) ->
+    {_, Evt} = raw2evt(
+        new_pnode(
+            "node-e", 160000, 5, {'name', "node-e"}, true, 4
+        ),
+        Nodes, 0,
+        new_raw(
+            "evtid", ?EVT_NODE_EDIT, "node-c", 
+            {'name', "node-c"}, 90000, 3, true, 0
+        )
+    ),
+    [?_assertMatch({?EVT_NODE_EDIT, _}, type_orgname(Evt)),
+     ?_assertEqual("node-c", hc_node:name(hc_evt:cnode(Evt))),
+     ?_assertEqual({'name', "node-e"}, hc_node:attribs(hc_evt:cnode(Evt))),
+     ?_assert(hc_node:is_connected(hc_evt:cnode(Evt)))].
+
+from_up_2_custom(Nodes) ->
+    {_, Evt} = raw2evt(
+        new_pnode(
+            "node-e", 160000, 5, {'name', "node-e"}, true, 4
+        ),
+        Nodes, 0,
+        new_raw(
+            "evtid", "custom_evt", "node-x", 
+            {'prop', "val"}, 160000, 5, true, 0
+        )
+    ),
+    [?_assertMatch({"custom_evt", _}, type_orgname(Evt)),
+     ?_assertEqual("node-e", hc_node:name(hc_evt:cnode(Evt))),
+     ?_assertEqual({'prop', "val"}, hc_node:attribs(hc_evt:cnode(Evt)))].
+
+from_down_2_up(Nodes) ->
+    {_, Evt} = raw2evt(
+        new_pnode(
+            "node-e", 160000, 5, {'name', "node-e"}, false, 4
+        ),
+        Nodes, 0,
+        new_raw(
+            "evtid", ?EVT_NODE_UP, "node-e", 
+            {'name', "node-e"}, 160000, 5, true, 0
+        )
+    ),
+    [?_assertMatch({?EVT_NODE_UP, _}, type_orgname(Evt)),
+     ?_assertEqual("node-e", hc_node:name(hc_evt:cnode(Evt)))].
+
+from_down_2_up_diffname(Nodes) ->
+    {_, Evt} = raw2evt(
+        new_pnode(
+            "node-e", 160000, 5, {'name', "node-e"}, false, 4
+        ),
+        Nodes, 0,
+        new_raw(
+            "evtid", ?EVT_NODE_UP, "node-f", 
+            {'name', "node-f"}, 30000, 5, true, 0
+        )
+    ),
+    [?_assertMatch({?EVT_NODE_UP, _}, type_orgname(Evt)),
+     ?_assertEqual("node-f", hc_node:name(hc_evt:cnode(Evt)))].
+
+from_down_2_up_dupname(Nodes) ->
+    {_, Evt} = raw2evt(
+        new_pnode(
+            "node-e", 160000, 5, {'name', "node-e"}, false, 4
+        ),
+        Nodes, 0,
+        new_raw(
+            "evtid", ?EVT_NODE_UP, "node-a", 
+            {'name', "node-a"}, 160000, 5, true, 0
+        )
+    ),
+    [?_assertMatch({?EVT_NODE_UP, ?EVT_ERR_ALREADY_EXISTS}, type_reason(Evt))].
+
+from_down_2_down(Nodes) ->
+    {_, Evt} = raw2evt(
+        new_pnode(
+            "node-e", 160000, 5, {'name', "node-e"}, false, 4
+        ),
+        Nodes, 0,
+        new_raw(
+            "evtid", ?EVT_NODE_DOWN, "node-e", 
+            {'name', "node-e"}, 160000, 5, false, 0
+        )
+    ),
+    [?_assertMatch({?EVT_NODE_DOWN, ?EVT_ERR_DOWN}, type_reason(Evt))].
+
+from_down_2_edit(Nodes) ->
+    {_, Evt} = raw2evt(
+        new_pnode(
+            "node-e", 160000, 5, {'name', "node-e"}, false, 4
+        ),
+        Nodes, 0,
+        new_raw(
+            "evtid", ?EVT_NODE_EDIT, "node-c", 
+            {'name', "node-c"}, 90000, 3, false, 0
+        )
+    ),
+    [?_assertMatch({?EVT_NODE_EDIT, ?EVT_ERR_DOWN}, type_reason(Evt))].
+
+from_down_2_custom(Nodes) ->
+    {_, Evt} = raw2evt(
+        new_pnode(
+            "node-e", 160000, 5, {'name', "node-e"}, false, 4
+        ),
+        Nodes, 0,
+        new_raw(
+            "evtid", "custom_evt", "node-x", 
+            {'prop', "val"}, 160000, 5, true, 0
+        )
+    ),
+    [?_assertMatch({"custom_evt", ?EVT_ERR_DOWN}, type_reason(Evt))].
+
+-endif.
