@@ -26,7 +26,8 @@ api_test_() ->
              sync_pings_from_up(),
              no_sync_pings_from_down(),
              sync_pings_from_down(),
-             timeout_cases()]
+             timeout_cases(),
+             prim_stop()]
          end}
     }.
 
@@ -53,10 +54,11 @@ sec_init_wrong() ->
 
 sec_init_right() ->
     httpcluster_sec:init_cluster(atom_to_list(node()), 60000, cnodes()),
-    timer:sleep(1000),
+    timer:sleep(500),
+    P = httpcluster:is_active(),
+    S = httpcluster_sec:is_connected(),
     {"Testing the overall cluster init process.",
-     [?_assert(httpcluster:is_active()),
-      ?_assert(httpcluster_sec:is_connected())]}.
+     [?_assert(P), ?_assert(S)]}.
 
 %% node1, no raw, no sync
 %% node2, up, no sync
@@ -226,6 +228,11 @@ timeout_cases() ->
       ?_assertNot(hc_evt:is_evt(E2)),
       ?_assertMatch(2, LenLiveNodes(SNs))]}.
 
+prim_stop() ->
+    R1 = httpcluster:deactivate(),
+    R2 = httpcluster:deactivate(),
+    [?_assertMatch(ok, R1), ?_assertMatch({error, 'not_active'}, R2)].
+
 % TODO: httpcluster_sec module tests.
 
 %%====================================================================
@@ -234,9 +241,9 @@ timeout_cases() ->
 
 cnodes() ->
     hc_node:list_to_cnodes([
-        hc_node:new(atom_to_list(node()), none, 180000, 5),
-        hc_node:new("somenode@location", none, 180000, 3),
-        hc_node:new("someothernode@location", none, 120000, 6, false, 0)
+        hc_node:new(atom_to_list(node()), att(), ttd(), prio()),
+        hc_node:new("somenode@location", att(), ttd(), prio()),
+        hc_node:new("someothernode@location", att(), ttd(), prio(), false, 0)
     ]).
 
 do_ping(NodeNum, RawType, Sync, Str) ->
@@ -262,7 +269,22 @@ ping(NodeNum, Raw, Sync) ->
     hc_evt:new_node_ping(Id, From, To, Raw, Sync).
 
 cnode(NodeNum) ->
-    hc_node:new(nodename(NodeNum), none, 180000, 5, false, 0).
+    hc_node:new(nodename(NodeNum), att(), ttd(), prio(), false, 0).
+
+att() ->
+    case random:uniform(2) of
+        1 -> 'undefined';
+        2 -> 'thing'
+    end.
+
+ttd() ->
+    case random:uniform(2) of
+        1 -> 0;
+        2 -> 120000
+    end.
+
+prio() ->
+    random:uniform(6).
 
 raw(Type, Node) ->
     Id = hc_evt:random_str(8),
