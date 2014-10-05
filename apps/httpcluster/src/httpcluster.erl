@@ -29,13 +29,19 @@
     is_active/0
 ]).
 
+%% Debugging
+-export([
+    get_nodes/0,
+    get_evts/0
+]).
+
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
          terminate/2, code_change/3]).
 
 %% Module internal
 -export([
-    'cast_node_pong'/3,
+    'cast_node_pong'/4,
     'reply_with_node_reply_error'/6,
     'reply_with_node_pong_ok'/6
 ]).
@@ -144,6 +150,18 @@ deactivate() ->
 is_active() ->
     gen_server:call(?SERVER, 'is_active').
 
+%% @doc Get the local nodes list. For debugging purposes.
+-spec get_nodes() -> Nodes
+    when Nodes :: [pnode()].
+get_nodes() ->
+    gen_server:call(?SERVER, 'get_nodes').
+
+%% @doc Get the local history list. For debugging purposes.
+-spec get_evts() -> Hist
+    when Hist :: [hc_evt:evt() | hc_evt:evt_err()].
+get_evts() ->
+    gen_server:call(?SERVER, 'get_evts').
+
 %%====================================================================
 %% gen_server callbacks
 %%====================================================================
@@ -198,6 +216,12 @@ handle_call('deactivate', _From, Sd) ->
 
 handle_call('is_active', _From, #sd{this_id=ThisId}=Sd) ->
     {reply, ThisId =/= 'undefined', Sd};
+
+handle_call('get_nodes', _From, Sd) ->
+    {reply, Sd#sd.nodes, Sd};
+
+handle_call('get_evts', _From, Sd) ->
+    {reply, Sd#sd.evts, Sd};
 
 handle_call(_Msg, _From, Sd) ->
     {reply, {error, 'undefined'}, Sd}.
@@ -341,6 +365,9 @@ is_local_id(_)                        -> false.
 
 store_node('undefined', Nodes)   -> Nodes;
 store_node(#pnode{}=Node, Nodes) -> [Node|Nodes].
+
+local_id(#pnode{local_id=Id}) -> Id;
+local_id('undefined')         -> 'undefined'.
 %% -----------------
 
 %% When a node_ping() is received from a remote node, it will be checked
@@ -393,18 +420,18 @@ do_handle_node_ping(ThisId, Ping, From, #sd{nodes=Nodes}=Sd) ->
     case hc_evt:node_com_destination(Ping) of
         ThisNameOrig ->
             % Process the valid ping that may or may not contain a raw.
-            {{Evt, _}=Tuple, #sd{nodes=Nodes1}=Sd1} = handle_raw_from_node(
+            {{Id, Evt, Cnodes}, #sd{nodes=Nodes1}=Sd1} = handle_raw_from_node(
                 PingSource, hc_evt:node_ping_raw(Ping), 
                 hc_evt:node_ping_sync(Ping), Sd
             ),
             % Reply back with the result.
             proc_lib:spawn_link(
                 ?MODULE, 'reply_with_node_pong_ok',
-                [PingId, Tuple, {ThisId, ThisNameOrig},
+                [PingId, {Evt, Cnodes}, {ThisId, ThisNameOrig},
                  PingSource, Nodes1, From]
             ),
             % Dessiminate the event to other nodes if applicable.
-            node_cast(Evt, ThisId, Nodes1),
+            node_cast(Id, Evt, {ThisId, ThisNameOrig}, Nodes1),
             Sd1;
         _ ->
             proc_lib:spawn_link(
@@ -415,10 +442,10 @@ do_handle_node_ping(ThisId, Ping, From, #sd{nodes=Nodes}=Sd) ->
             Sd
     end.
 
-node_cast('undefined', _ThisId, _Nodes) ->
+node_cast(_Id, 'undefined', _ThisInfo, _Nodes) ->
     ok;
-node_cast(Evt, ThisId, Nodes) ->
-    proc_lib:spawn_link(?MODULE, 'cast_node_pong', [Evt, ThisId, Nodes]).
+node_cast(Id, Evt, ThisInfo, Nodes) ->
+    proc_lib:spawn_link(?MODULE, 'cast_node_pong', [Id, Evt, ThisInfo, Nodes]).
 
 is_nodeup4(Name, Ping) ->
     (hc_evt:node_com_source(Ping) =:= Name) andalso 
@@ -428,41 +455,34 @@ is_nodeup4(Name, Ping) ->
 %% @doc Create and broadcast a node_pong(). Create a node_pong()
 %%      record containing `Evt' and send it to all connected 
 %%      nodes except for this node and the subject node of `Evt'.
--spec 'cast_node_pong'(Evt, ThisId, Nodes) -> _
+-spec 'cast_node_pong'(EvtSourceId, Evt, {ThisId, ThisNameOrig}, Nodes) -> _
     when
-        Evt    :: hc_evt:evt(),
-        ThisId :: local_id(),
-        Nodes  :: [pnode()].
-'cast_node_pong'(Evt, ThisId, Nodes) ->
+        EvtSourceId  :: 'undefined' | local_id(),
+        Evt          :: hc_evt:evt() | hc_evt:evt_err(),
+        ThisId       :: local_id(),
+        ThisNameOrig :: hc_node:name(),
+        Nodes        :: [pnode()].
+'cast_node_pong'(EvtSourceId, Evt, {ThisId, ThisNameOrig}, Nodes) ->
     proc_lib:init_ack({ok, self()}),
-    PongId = hc_evt:random_str(8),
-    XNode = get_node(hc_node:name(hc_evt:cnode(Evt)), Nodes),
     {ThisNode, OtherNodes} = take_node(ThisId, Nodes),
-    Tuple = {
-        ThisNode#pnode.name, 
-        to_cnode(ThisNode), 
-        [to_cnode(Node) || Node <- OtherNodes]
-    },
-    [cast_pongdata(PongId, Evt, Tuple, N) || 
-        N <- OtherNodes,
-        N#pnode.con,
-        N#pnode.local_id =/= XNode#pnode.local_id].
+    FromInfo    = {to_cnode(ThisNode), ThisNameOrig},
+    OtherCnodes = [to_cnode(Nx) || Nx <- OtherNodes],
+    PongId      = hc_evt:random_str(8),
+    [do_cast_pongdata(PongId, Evt, FromInfo, to_cnode(N), OtherCnodes) ||
+        N <- Nodes, N#pnode.con, N#pnode.local_id =/= EvtSourceId].
 
-cast_pongdata(
-    PongId, Evt, {SourceName, SourceCnode, OtherCnodes}, 
-    #pnode{name=DestName}=DestNode
-) ->
+do_cast_pongdata(PongId, Evt, {FromCnode, FromName}, ToCnode, OtherCnodes) ->
     NodePong = hc_evt:new_node_pong(
-        PongId, SourceName, DestName, Evt, 'undefined'
+        PongId, FromName, hc_node:name(ToCnode), Evt, 'undefined'
     ),
     ?apply_coms_fun(
         ?HANDLER_PONG_TO_NODE,
         [
             ?apply_coms_fun(
                 ?HANDLER_CREATE_PONGDATA,
-                [NodePong, SourceCnode, OtherCnodes]
+                [NodePong, FromCnode, OtherCnodes]
             ),
-            SourceCnode, to_cnode(DestNode)
+            FromCnode, ToCnode
         ]
     ).
 
@@ -527,16 +547,18 @@ create_pongdata_then_reply(NodeCom, Source, Nodes, From) ->
     gen_server:reply(From, {ok, Data}).
 %% -----------------
 
-%% Process a given evt_raw (ReqRaw) from a node (ReqNodeName)
+%% Processes a given evt_raw (ReqRaw) from a node (ReqNodeName)
 %% into the server state data and return the resulting evt or evt_err.
-%% Also return the current Nodes list if ReqDoSync is true.
+%% Also returns the local_id of the subject node, and the current 
+%% Nodes list if ReqDoSync is true.
 -spec handle_raw_from_node(ReqNodeName, ReqRaw, ReqDoSync, Sd) ->
-    {{Evt, Nodes}, Sd1}
+    {{Id, Evt, Nodes}, Sd1}
     when
         ReqNodeName :: hc_node:name(),
         ReqRaw      :: 'undefined' | hc_evt:evt_raw(),
         ReqDoSync   :: boolean(),
         Sd          :: sd(),
+        Id          :: 'undefined' | local_id(),
         Evt         :: 'undefined' | hc_evt:evt() | hc_evt:evt_err(),
         Nodes       :: 'undefined' | hc_node:cnodes(),
         Sd1         :: sd().
@@ -547,14 +569,14 @@ handle_raw_from_node(
     log_if_defined(
         ReqRaw, "Begin processing evt_raw from ~p: ~p", [ReqNodeName, ReqRaw]
     ),
-    Tuple = {Evt, _,_} = process_raw(
+    {Id, Evt, Nodes1, Timers1} = process_raw(
         {ReqNodeName, ReqRaw}, get_last_evtid(Evts), Nodes, Timers
     ),
     log_if_defined(
         Evt, "Done processing evt_raw from ~p: ~p", [ReqNodeName, Evt]
     ),
-    Return = {Evt, undef_or_cnodes(ReqDoSync, Nodes)},
-    {Return, update_sd(Tuple, Sd)}.
+    Return = {Id, Evt, undef_or_cnodes(ReqDoSync, Nodes)},
+    {Return, update_sd({Evt, Nodes1, Timers1}, Sd)}.
 
 log_if_defined('undefined', _,_) -> ok;
 log_if_defined(_, Format, Args)  -> ?log_debug(Format, Args).
@@ -573,7 +595,9 @@ undef_or_cnodes(false, _) ->
         Timer :: hc_timer:timer(), 
         Sd    :: sd(),
         Sd1   :: sd().
-handle_ttd_timeout(Timer, #sd{nodes=Nodes, evts=Evts, timers=Timers}=Sd) ->
+handle_ttd_timeout(
+    Timer, #sd{this_id=ThisId, nodes=Nodes, evts=Evts, timers=Timers}=Sd
+) ->
     % Include an additional check to make sure no NODE_DOWN 
     % evts are created for non-existing nodes.
     Ident = hc_timer:ident(Timer),
@@ -581,11 +605,14 @@ handle_ttd_timeout(Timer, #sd{nodes=Nodes, evts=Evts, timers=Timers}=Sd) ->
         'undefined' ->
             Sd;
         Node ->
-            Tuple = process_raw(
+            #pnode{name=ThisNameOrig} = get_node(ThisId, Nodes),
+            {Id, Evt, Nodes1, Timers1} = process_raw(
                 {Ident, nodedown_raw("ttd_timeout_", Node)},
                 get_last_evtid(Evts), Nodes, Timers
             ),
-            update_sd(Tuple, Sd)
+            Sd1 = update_sd({Evt, Nodes1, Timers1}, Sd),
+            node_cast(Id, Evt, {ThisId, ThisNameOrig}, Sd1#sd.nodes),
+            Sd1
     end.
 
 nodedown_raw(Prefix, Node) ->
@@ -598,13 +625,14 @@ nodedown_raw(Prefix, Node) ->
 
 %% Do the thing!
 -spec process_raw({NodeIdent, Raw}, LastEvtId, Nodes, Timers) ->
-    {Evt, Nodes1, Timers1}
+    {Id, Evt, Nodes1, Timers1}
     when
         NodeIdent :: hc_node:name() | local_id(),
         Raw       :: 'undefined' | hc_evt:evt_raw(),
         LastEvtId :: 0 | hc_evt:id(),
         Nodes     :: [pnode()],
         Timers    :: hc_timer:timers(),
+        Id        :: 'undefined' | local_id(),
         Evt       :: 'undefined' | hc_evt:evt() | hc_evt:evt_err(),
         Nodes1    :: [pnode()],
         Timers1   :: hc_timer:timers().
@@ -614,7 +642,7 @@ process_raw({NodeIdent, Raw}, LastEvtId, Nodes, Timers) ->
         Node, OtherNodes, LastEvtId, Raw, Timers
     ),
     Nodes1 = store_node(Node1, OtherNodes),
-    {Evt1, Nodes1, Timers1}.
+    {local_id(Node1), Evt1, Nodes1, Timers1}.
 
 raw2evt_with_timer_triggers(OldNode, _,_, 'undefined', Timers) ->
     {OldNode, 'undefined', trigger_timer(OldNode, Timers, true)};
@@ -799,16 +827,10 @@ new_raw(RawName, Type, NodeName, Attribs, Ttd, Prio, Con, Rank) ->
     ).
 
 type_orgname(E) ->
-    case hc_evt:is_evt(E) of
-        true  -> {hc_evt:type(E), hc_evt:org_name(E)};
-        false -> 'undefined'
-    end.
+    {hc_evt:type(E), hc_evt:org_name(E)}.
 
 type_reason(E) ->
-    case hc_evt:is_evt(E) of
-        true  -> 'undefined';
-        false -> {hc_evt:type(E), hc_evt:reason(E)}
-    end.
+    {hc_evt:type(E), hc_evt:reason(E)}.
 
 from_undef_2_up(Nodes) ->
     {_, Evt} = raw2evt(

@@ -81,7 +81,7 @@ comms_mod_start() ->
     meck:expect(?COM, 'cluster_event',
         fun(EvtType, OldNode, NewNode, Nodes) ->
             ?log_debug(
-                "Fun called: cluster_event/4"
+                "Fun called: cluster_event/4~n"
                 "EvtType: ~p~n"
                 "OldNode: ~p~n"
                 "NewNode: ~p~n"

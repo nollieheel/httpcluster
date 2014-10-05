@@ -21,6 +21,12 @@
     is_connected/0
 ]).
 
+%% Debugging
+-export([
+    get_nodes/0,
+    get_evts/0
+]).
+
 %% gen_fsm callbacks
 -export([init/1, handle_event/3, handle_sync_event/4, handle_info/3,
          terminate/3, code_change/4]).
@@ -143,6 +149,18 @@ evt_raw(Raw) ->
 -spec is_connected() -> boolean().
 is_connected() ->
     gen_fsm:sync_send_all_state_event(?SERVER, 'is_connected').
+
+%% @doc Get the local nodes list. For debugging purposes.
+-spec get_nodes() -> Nodes
+    when Nodes :: hc_node:cnodes().
+get_nodes() ->
+    gen_fsm:sync_send_all_state_event(?SERVER, 'get_nodes').
+
+%% @doc Get the local history list. For debugging purposes.
+-spec get_evts() -> Hist
+    when Hist :: evts_list().
+get_evts() ->
+    gen_fsm:sync_send_all_state_event(?SERVER, 'get_evts').
 
 %%====================================================================
 %% gen_fsm callbacks and internal states
@@ -324,6 +342,12 @@ handle_sync_event({'pong_cast', _}, _From, State, Sd) ->
 
 handle_sync_event('is_connected', _From, State, Sd) ->
     {reply, current_role(Sd) =/= ?ROLE_DISC, State, Sd};
+
+handle_sync_event('get_nodes', _From, State, Sd) ->
+    {reply, Sd#sd.nodes, State, Sd};
+
+handle_sync_event('get_evts', _From, State, Sd) ->
+    {reply, Sd#sd.evts, State, Sd};
 
 handle_sync_event(_Msg, _From, State, Sd) ->
     {reply, {error, 'undefined'}, State, Sd}.
@@ -886,7 +910,7 @@ update_nodes(This, Prim, EvtOrgName, EvtNode, Nodes, PrimExs) ->
             {This1, Prim1, Nodes1};
         false ->
             updates_4_disc_evtnode(
-                This, Prim, EvtOrgName, EvtNode, Nodes, PrimExs
+                This, Prim, EvtOrgName, EvtNode, Nodes1, PrimExs
             )
     end.
 
